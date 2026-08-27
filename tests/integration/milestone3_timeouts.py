@@ -156,17 +156,25 @@ def scenario_connect_timeout(args) -> dict:
                             for event in events_named(events, "upstream_connected")
                         ):
                             outcome = "connected"
+                    if events_named(events, "upstream_connect_failed"):
+                        # The kernel refused (RST) against the full queue, e.g.
+                        # tcp_abort_on_overflow=1 or a filler race; the connect
+                        # never hangs, so the timeout cannot be exercised.
+                        outcome = "refused"
                     if outcome is None:
                         time.sleep(0.05)
 
-                if outcome == "connected":
+                if outcome in ("connected", "refused"):
                     return {
                         "scenario": "connect_timeout",
                         "status": "skipped_environment",
-                        "reason": "kernel completed the handshake against a full accept queue",
+                        "reason": f"upstream connect did not hang ({outcome}) against a full accept queue",
                     }
                 if outcome != "timed_out":
-                    raise AssertionError("neither connect_timeout nor upstream_connected was observed")
+                    raise AssertionError(
+                        "no connect outcome was observed; last events: "
+                        + json.dumps(read_events(proxy_log)[-10:])
+                    )
 
                 try:
                     trailing = sock.recv(4096)
