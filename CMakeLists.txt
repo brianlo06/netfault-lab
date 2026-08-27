@@ -29,6 +29,8 @@ endif()
 add_library(netfault_core STATIC
   src/common/endpoint.cpp
   src/common/logger.cpp
+  src/common/relay.cpp
+  src/common/socket_io.cpp
 )
 target_include_directories(netfault_core PUBLIC include)
 target_link_libraries(netfault_core PUBLIC netfault_warnings)
@@ -56,6 +58,7 @@ if(BUILD_TESTING)
     tests/unit/byte_queue_test.cpp
     tests/unit/connection_state_test.cpp
     tests/unit/endpoint_test.cpp
+    tests/unit/relay_test.cpp
   )
   target_link_libraries(netfault-unit-tests PRIVATE netfault_core Catch2::Catch2WithMain netfault_warnings)
 

@@ -1,9 +1,9 @@
 #include "netfault/proxy.hpp"
 
-#include "netfault/backpressure.hpp"
-#include "netfault/byte_queue.hpp"
 #include "netfault/connection_state.hpp"
 #include "netfault/logger.hpp"
+#include "netfault/relay.hpp"
+#include "netfault/socket_io.hpp"
 #include "netfault/unique_fd.hpp"
 
 #include <arpa/inet.h>
@@ -17,11 +17,9 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -34,48 +32,37 @@ constexpr std::uint64_t kListenerToken = 1;
 constexpr std::uint64_t kSignalToken = 2;
 constexpr int kMaxEvents = 128;
 
-enum class Side { Client, Upstream };
+// Forwards relay events into the shared JSON Lines logger under one connection id.
+class ConnectionLogObserver final : public RelayObserver {
+ public:
+  ConnectionLogObserver(const Logger& logger, std::uint64_t connection_id)
+      : logger_(logger), connection_id_(connection_id) {}
 
-struct EndpointState {
-  UniqueFd fd;
-  bool read_open{true};
-  bool write_open{true};
-  bool connecting{false};
-  std::uint64_t token{0};
-};
+  void on_event(std::string_view event, ConnectionState state, std::string_view detail) override {
+    logger_.event(event, connection_id_, state_name(state), detail);
+  }
 
-struct ConnectionMetrics {
-  std::uint64_t client_bytes_read{0};
-  std::uint64_t upstream_bytes_read{0};
-  std::uint64_t client_bytes_written{0};
-  std::uint64_t upstream_bytes_written{0};
-  std::uint64_t read_operations{0};
-  std::uint64_t write_operations{0};
-  std::uint64_t partial_writes{0};
-  std::uint64_t eagain_events{0};
+ private:
+  const Logger& logger_;
+  std::uint64_t connection_id_;
 };
 
 struct Connection {
   Connection(std::uint64_t connection_id, UniqueFd client_socket, UniqueFd upstream_socket,
-             std::size_t buffer_capacity, std::size_t low_water_bytes, std::size_t high_water_bytes)
+             bool upstream_connecting, const RelayConfig& relay_config, SocketIo& io, const Logger& logger)
       : id(connection_id),
-        client{std::move(client_socket)},
-        upstream{std::move(upstream_socket)},
-        client_to_upstream(buffer_capacity),
-        upstream_to_client(buffer_capacity),
-        client_to_upstream_backpressure(low_water_bytes, high_water_bytes),
-        upstream_to_client_backpressure(low_water_bytes, high_water_bytes) {}
+        client_fd(std::move(client_socket)),
+        upstream_fd(std::move(upstream_socket)),
+        observer(logger, connection_id),
+        relay(relay_config, client_fd.get(), upstream_fd.get(), upstream_connecting, io, observer) {}
 
   std::uint64_t id;
-  ConnectionState state{ConnectionState::ConnectingUpstream};
-  EndpointState client;
-  EndpointState upstream;
-  ByteQueue client_to_upstream;
-  ByteQueue upstream_to_client;
-  BackpressureTracker client_to_upstream_backpressure;
-  BackpressureTracker upstream_to_client_backpressure;
-  ConnectionMetrics metrics;
-  std::chrono::steady_clock::time_point accepted_at{std::chrono::steady_clock::now()};
+  UniqueFd client_fd;
+  UniqueFd upstream_fd;
+  std::uint64_t client_token{0};
+  std::uint64_t upstream_token{0};
+  ConnectionLogObserver observer;
+  Relay relay;
 };
 
 struct SocketBinding {
@@ -198,6 +185,17 @@ class ProxyRuntime {
     }
   }
 
+  [[nodiscard]] static std::uint32_t to_epoll_mask(InterestSet interest) {
+    std::uint32_t events = EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+    if (interest.read) {
+      events |= EPOLLIN;
+    }
+    if (interest.write) {
+      events |= EPOLLOUT;
+    }
+    return events;
+  }
+
   void accept_ready() {
     while (true) {
       UniqueFd client{::accept4(listener_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC)};
@@ -233,54 +231,29 @@ class ProxyRuntime {
       }
 
       const auto connection_id = next_connection_id_++;
+      const RelayConfig relay_config{
+          .buffer_bytes_per_direction = config_.buffer_bytes_per_direction,
+          .low_water_bytes = config_.low_water_bytes,
+          .high_water_bytes = config_.high_water_bytes,
+      };
       auto connection = std::make_unique<Connection>(connection_id, std::move(client), std::move(upstream),
-                                                     config_.buffer_bytes_per_direction, config_.low_water_bytes,
-                                                     config_.high_water_bytes);
-      connection->upstream.connecting = connecting;
-      connection->state = connecting ? ConnectionState::ConnectingUpstream : ConnectionState::Active;
-      connection->client.token = next_token_++;
-      connection->upstream.token = next_token_++;
+                                                     connecting, relay_config, socket_io_, logger_);
+      connection->client_token = next_token_++;
+      connection->upstream_token = next_token_++;
 
-      const int client_fd = connection->client.fd.get();
-      const int upstream_fd = connection->upstream.fd.get();
-      bindings_.emplace(connection->client.token, SocketBinding{connection_id, Side::Client});
-      bindings_.emplace(connection->upstream.token, SocketBinding{connection_id, Side::Upstream});
-      connections_.emplace(connection_id, std::move(connection));
-      add_epoll(client_fd, desired_events(*connections_.at(connection_id), Side::Client),
-                connections_.at(connection_id)->client.token);
-      add_epoll(upstream_fd, desired_events(*connections_.at(connection_id), Side::Upstream),
-                connections_.at(connection_id)->upstream.token);
-      logger_.event("connection_accepted", connection_id, state_name(connections_.at(connection_id)->state));
+      const int client_fd = connection->client_fd.get();
+      const int upstream_fd = connection->upstream_fd.get();
+      bindings_.emplace(connection->client_token, SocketBinding{connection_id, Side::Client});
+      bindings_.emplace(connection->upstream_token, SocketBinding{connection_id, Side::Upstream});
+      const auto& inserted = *connections_.emplace(connection_id, std::move(connection)).first->second;
+      add_epoll(client_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Client)), inserted.client_token);
+      add_epoll(upstream_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Upstream)),
+                inserted.upstream_token);
+      logger_.event("connection_accepted", connection_id, state_name(inserted.relay.state()));
       if (!connecting) {
         logger_.event("upstream_connected", connection_id, "active");
       }
     }
-  }
-
-  [[nodiscard]] std::uint32_t desired_events(const Connection& connection, Side side) const {
-    constexpr std::uint32_t base = EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-    if (side == Side::Client) {
-      std::uint32_t events = base;
-      if (connection.client.read_open && !connection.client_to_upstream_backpressure.read_paused()) {
-        events |= EPOLLIN;
-      }
-      if (connection.client.write_open && !connection.upstream_to_client.empty()) {
-        events |= EPOLLOUT;
-      }
-      return events;
-    }
-
-    std::uint32_t events = base;
-    if (connection.upstream.connecting) {
-      return events | EPOLLOUT;
-    }
-    if (connection.upstream.read_open && !connection.upstream_to_client_backpressure.read_paused()) {
-      events |= EPOLLIN;
-    }
-    if (connection.upstream.write_open && !connection.client_to_upstream.empty()) {
-      events |= EPOLLOUT;
-    }
-    return events;
   }
 
   void socket_ready(std::uint64_t token, std::uint32_t events) {
@@ -295,182 +268,53 @@ class ProxyRuntime {
     }
     Connection& connection = *connection_iterator->second;
 
-    if (binding.side == Side::Upstream && connection.upstream.connecting && (events & EPOLLOUT) != 0U) {
+    if (binding.side == Side::Upstream && connection.relay.upstream_connecting() && (events & EPOLLOUT) != 0U) {
       int socket_error = 0;
       socklen_t length = sizeof(socket_error);
-      if (::getsockopt(connection.upstream.fd.get(), SOL_SOCKET, SO_ERROR, &socket_error, &length) < 0 ||
+      if (::getsockopt(connection.upstream_fd.get(), SOL_SOCKET, SO_ERROR, &socket_error, &length) < 0 ||
           socket_error != 0) {
         const int error = socket_error != 0 ? socket_error : errno;
         close_connection(connection.id, ConnectionState::Failed,
                          "upstream_connect=" + std::string{std::strerror(error)});
         return;
       }
-      connection.upstream.connecting = false;
-      connection.state = ConnectionState::Active;
+      connection.relay.mark_upstream_connected();
       logger_.event("upstream_connected", connection.id, "active");
     }
 
-    if ((events & EPOLLERR) != 0U && !connection.upstream.connecting) {
+    if ((events & EPOLLERR) != 0U && !connection.relay.upstream_connecting()) {
       int socket_error = 0;
       socklen_t length = sizeof(socket_error);
-      if (::getsockopt(binding.side == Side::Client ? connection.client.fd.get() : connection.upstream.fd.get(),
-                       SOL_SOCKET, SO_ERROR, &socket_error, &length) == 0 && socket_error != 0) {
-        close_connection(connection.id, socket_error == ECONNRESET ? ConnectionState::Reset : ConnectionState::Failed,
+      const int fd = binding.side == Side::Client ? connection.client_fd.get() : connection.upstream_fd.get();
+      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) == 0 && socket_error != 0) {
+        close_connection(connection.id,
+                         socket_error == ECONNRESET ? ConnectionState::Reset : ConnectionState::Failed,
                          std::strerror(socket_error));
         return;
       }
     }
 
-    if (connections_.find(binding.connection_id) == connections_.end()) {
-      return;
-    }
-
-    bool ok = true;
-    if (binding.side == Side::Client && (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0U) {
-      ok = read_into(connection, Side::Client, (events & (EPOLLRDHUP | EPOLLHUP)) != 0U);
-    } else if (binding.side == Side::Upstream && !connection.upstream.connecting &&
-               (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0U) {
-      ok = read_into(connection, Side::Upstream, (events & (EPOLLRDHUP | EPOLLHUP)) != 0U);
-    }
-    if (!ok || connections_.find(binding.connection_id) == connections_.end()) {
-      return;
-    }
-
-    if (!connection.upstream.connecting) {
-      if (!flush(connection, Side::Upstream) || !flush(connection, Side::Client)) {
+    const bool readable_event = (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0U;
+    const bool hangup_hint = (events & (EPOLLRDHUP | EPOLLHUP)) != 0U;
+    if (readable_event && !(binding.side == Side::Upstream && connection.relay.upstream_connecting())) {
+      const auto result = connection.relay.handle_readable(binding.side, hangup_hint);
+      if (result.status == PumpStatus::CloseConnection) {
+        close_connection(connection.id, result.final_state, result.reason);
         return;
       }
     }
-    propagate_half_closes(connection);
+
+    if (!connection.relay.upstream_connecting()) {
+      for (const Side destination : {Side::Upstream, Side::Client}) {
+        const auto result = connection.relay.flush(destination);
+        if (result.status == PumpStatus::CloseConnection) {
+          close_connection(connection.id, result.final_state, result.reason);
+          return;
+        }
+      }
+    }
+    connection.relay.propagate_half_closes();
     refresh_or_close(connection.id);
-  }
-
-  bool read_into(Connection& connection, Side source_side, bool hangup_hint) {
-    EndpointState& source = source_side == Side::Client ? connection.client : connection.upstream;
-    ByteQueue& destination_queue =
-        source_side == Side::Client ? connection.client_to_upstream : connection.upstream_to_client;
-    BackpressureTracker& backpressure = source_side == Side::Client
-                                                ? connection.client_to_upstream_backpressure
-                                                : connection.upstream_to_client_backpressure;
-
-    while (source.read_open && !backpressure.read_paused()) {
-      const auto available_to_high_water = backpressure.high_water_bytes() - destination_queue.size();
-      const auto full_writable_span = destination_queue.writable_span();
-      const auto writable = full_writable_span.first(std::min(full_writable_span.size(), available_to_high_water));
-      const auto count = ::recv(source.fd.get(), writable.data(), writable.size(), 0);
-      if (count > 0) {
-        const auto bytes = static_cast<std::size_t>(count);
-        destination_queue.commit_write(bytes);
-        ++connection.metrics.read_operations;
-        if (source_side == Side::Client) {
-          connection.metrics.client_bytes_read += static_cast<std::uint64_t>(bytes);
-        } else {
-          connection.metrics.upstream_bytes_read += static_cast<std::uint64_t>(bytes);
-        }
-        observe_backpressure(connection, source_side);
-        continue;
-      }
-      if (count == 0) {
-        source.read_open = false;
-        logger_.event("peer_half_closed", connection.id, state_name(connection.state),
-                      source_side == Side::Client ? "direction=client_read" : "direction=upstream_read");
-        break;
-      }
-      if (errno == EINTR) {
-        continue;
-      }
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        ++connection.metrics.eagain_events;
-        if (hangup_hint) {
-          source.read_open = false;
-          logger_.event("peer_half_closed", connection.id, state_name(connection.state),
-                        source_side == Side::Client ? "direction=client_read" : "direction=upstream_read");
-        }
-        break;
-      }
-      close_connection(connection.id, errno == ECONNRESET ? ConnectionState::Reset : ConnectionState::Failed,
-                       "read=" + std::string{std::strerror(errno)});
-      return false;
-    }
-    return true;
-  }
-
-  bool flush(Connection& connection, Side destination_side) {
-    EndpointState& destination = destination_side == Side::Client ? connection.client : connection.upstream;
-    ByteQueue& source_queue =
-        destination_side == Side::Client ? connection.upstream_to_client : connection.client_to_upstream;
-    if (!destination.write_open || destination.connecting) {
-      return true;
-    }
-
-    while (!source_queue.empty()) {
-      const auto readable = source_queue.readable_span();
-      const auto count = ::send(destination.fd.get(), readable.data(), readable.size(), MSG_NOSIGNAL);
-      if (count > 0) {
-        const auto bytes = static_cast<std::size_t>(count);
-        if (bytes < readable.size()) {
-          ++connection.metrics.partial_writes;
-        }
-        source_queue.consume(bytes);
-        observe_backpressure(connection, destination_side == Side::Upstream ? Side::Client : Side::Upstream);
-        ++connection.metrics.write_operations;
-        if (destination_side == Side::Client) {
-          connection.metrics.client_bytes_written += static_cast<std::uint64_t>(bytes);
-        } else {
-          connection.metrics.upstream_bytes_written += static_cast<std::uint64_t>(bytes);
-        }
-        continue;
-      }
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        ++connection.metrics.eagain_events;
-        break;
-      }
-      const int error = count < 0 ? errno : EPIPE;
-      close_connection(connection.id, error == ECONNRESET || error == EPIPE ? ConnectionState::Reset
-                                                                            : ConnectionState::Failed,
-                       "write=" + std::string{std::strerror(error)});
-      return false;
-    }
-    return true;
-  }
-
-  void observe_backpressure(Connection& connection, Side source_side) {
-    ByteQueue& queue = source_side == Side::Client ? connection.client_to_upstream
-                                                   : connection.upstream_to_client;
-    BackpressureTracker& tracker = source_side == Side::Client
-                                       ? connection.client_to_upstream_backpressure
-                                       : connection.upstream_to_client_backpressure;
-    const auto transition = tracker.observe(queue.size(), queue.capacity(), BackpressureTracker::Clock::now());
-    if (transition == BackpressureTransition::None) {
-      return;
-    }
-    const auto direction = source_side == Side::Client ? "client_to_upstream" : "upstream_to_client";
-    const auto event = transition == BackpressureTransition::Paused ? "read_paused" : "read_resumed";
-    logger_.event(event, connection.id, state_name(connection.state),
-                  "direction=" + std::string{direction} + ",queue_bytes=" + std::to_string(queue.size()) +
-                      ",low_water_bytes=" + std::to_string(tracker.low_water_bytes()) +
-                      ",high_water_bytes=" + std::to_string(tracker.high_water_bytes()));
-  }
-
-  void propagate_half_closes(Connection& connection) {
-    if (!connection.client.read_open && connection.client_to_upstream.empty() &&
-        connection.upstream.write_open && !connection.upstream.connecting) {
-      if (::shutdown(connection.upstream.fd.get(), SHUT_WR) == 0 || errno == ENOTCONN) {
-        connection.upstream.write_open = false;
-        logger_.event("half_close_forwarded", connection.id, state_name(connection.state),
-                      "direction=upstream_write");
-      }
-    }
-    if (!connection.upstream.read_open && connection.upstream_to_client.empty() && connection.client.write_open) {
-      if (::shutdown(connection.client.fd.get(), SHUT_WR) == 0 || errno == ENOTCONN) {
-        connection.client.write_open = false;
-        logger_.event("half_close_forwarded", connection.id, state_name(connection.state),
-                      "direction=client_write");
-      }
-    }
   }
 
   void refresh_or_close(std::uint64_t connection_id) {
@@ -479,20 +323,14 @@ class ProxyRuntime {
       return;
     }
     Connection& connection = *iterator->second;
-    if (!connection.client.read_open && !connection.upstream.read_open && connection.client_to_upstream.empty() &&
-        connection.upstream_to_client.empty()) {
+    if (connection.relay.fully_drained()) {
       close_connection(connection_id, ConnectionState::FullyClosed, "orderly_shutdown");
       return;
     }
-
-    connection.state = derive_connection_state(ConnectionLifecycle{
-        .upstream_connecting = connection.upstream.connecting,
-        .client_read_open = connection.client.read_open,
-        .upstream_read_open = connection.upstream.read_open,
-    });
-
-    modify_epoll(connection.client.fd.get(), desired_events(connection, Side::Client), connection.client.token);
-    modify_epoll(connection.upstream.fd.get(), desired_events(connection, Side::Upstream), connection.upstream.token);
+    modify_epoll(connection.client_fd.get(), to_epoll_mask(connection.relay.desired_interest(Side::Client)),
+                 connection.client_token);
+    modify_epoll(connection.upstream_fd.get(), to_epoll_mask(connection.relay.desired_interest(Side::Upstream)),
+                 connection.upstream_token);
   }
 
   void close_connection(std::uint64_t connection_id, ConnectionState final_state, std::string detail) {
@@ -501,54 +339,18 @@ class ProxyRuntime {
       return;
     }
     Connection& connection = *iterator->second;
-    connection.state = final_state;
-    static_cast<void>(::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, connection.client.fd.get(), nullptr));
-    static_cast<void>(::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, connection.upstream.fd.get(), nullptr));
-    bindings_.erase(connection.client.token);
-    bindings_.erase(connection.upstream.token);
-
-    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-                              std::chrono::steady_clock::now() - connection.accepted_at)
-                              .count();
-    detail += ",duration_ms=" + std::to_string(duration);
-    detail += ",client_read=" + std::to_string(connection.metrics.client_bytes_read);
-    detail += ",upstream_read=" + std::to_string(connection.metrics.upstream_bytes_read);
-    detail += ",client_written=" + std::to_string(connection.metrics.client_bytes_written);
-    detail += ",upstream_written=" + std::to_string(connection.metrics.upstream_bytes_written);
-    detail += ",read_operations=" + std::to_string(connection.metrics.read_operations);
-    detail += ",write_operations=" + std::to_string(connection.metrics.write_operations);
-    detail += ",partial_writes=" + std::to_string(connection.metrics.partial_writes);
-    detail += ",eagain_events=" + std::to_string(connection.metrics.eagain_events);
-    detail += ",rejected_bytes=0";
-    detail += ",c2u_high_water=" + std::to_string(connection.client_to_upstream.high_water_mark());
-    detail += ",u2c_high_water=" + std::to_string(connection.upstream_to_client.high_water_mark());
-    const auto now = BackpressureTracker::Clock::now();
-    detail += ",c2u_pause_count=" +
-              std::to_string(connection.client_to_upstream_backpressure.pause_count());
-    detail += ",c2u_resume_count=" +
-              std::to_string(connection.client_to_upstream_backpressure.resume_count());
-    detail += ",c2u_saturation_count=" +
-              std::to_string(connection.client_to_upstream_backpressure.saturation_count());
-    detail += ",c2u_paused_us=" +
-              std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
-                                 connection.client_to_upstream_backpressure.paused_duration(now))
-                                 .count());
-    detail += ",u2c_pause_count=" +
-              std::to_string(connection.upstream_to_client_backpressure.pause_count());
-    detail += ",u2c_resume_count=" +
-              std::to_string(connection.upstream_to_client_backpressure.resume_count());
-    detail += ",u2c_saturation_count=" +
-              std::to_string(connection.upstream_to_client_backpressure.saturation_count());
-    detail += ",u2c_paused_us=" +
-              std::to_string(std::chrono::duration_cast<std::chrono::microseconds>(
-                                 connection.upstream_to_client_backpressure.paused_duration(now))
-                                 .count());
+    static_cast<void>(::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, connection.client_fd.get(), nullptr));
+    static_cast<void>(::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, connection.upstream_fd.get(), nullptr));
+    bindings_.erase(connection.client_token);
+    bindings_.erase(connection.upstream_token);
+    detail += connection.relay.close_detail();
     logger_.event("connection_closed", connection.id, state_name(final_state), detail);
     connections_.erase(iterator);
   }
 
   ProxyConfig config_;
   Logger logger_;
+  SystemSocketIo socket_io_;
   UniqueFd listener_;
   UniqueFd signal_fd_;
   UniqueFd epoll_fd_;
