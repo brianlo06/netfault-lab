@@ -104,10 +104,16 @@ def scenario_idle_timeout(args) -> dict:
 
 
 def scenario_connect_timeout(args) -> dict:
-    """A SYN-queue-saturated upstream must trip the connect timeout."""
+    """A SYN-queue-saturated upstream must trip the connect timeout.
+
+    The hang relies on the kernel dropping SYNs to a full accept queue. With
+    net.ipv4.tcp_syncookies=1 a handshake can instead complete against the
+    full queue (the server silently drops the child), in which case the proxy
+    legitimately sees a connected upstream and no timeout can fire; the
+    scenario detects that environment and reports itself skipped rather than
+    failing. CI disables syncookies so the strict path runs there.
+    """
     with tempfile.TemporaryFile(mode="w+") as proxy_log:
-        # A listener that never accepts, with a minimal backlog that raw
-        # connections fill first, so the proxy's own connect hangs in SYN_SENT.
         blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         fillers = []
         proxy = None
@@ -128,21 +134,49 @@ def scenario_connect_timeout(args) -> dict:
             proxy, proxy_port = start_proxy(args, proxy_log, upstream_port, ["--connect-timeout-ms", "400"])
             started = time.monotonic()
             with socket.create_connection(("127.0.0.1", proxy_port), timeout=10) as sock:
-                sock.settimeout(10)
+                sock.settimeout(8)
+
+                # Watch the log for this connection's fate: a connect_timeout
+                # close (strict path) or a completed upstream connect
+                # (syncookie environment).
+                outcome = None
+                deadline = time.monotonic() + 6
+                while time.monotonic() < deadline and outcome is None:
+                    events = read_events(proxy_log)
+                    accepted = events_named(events, "connection_accepted")
+                    if accepted:
+                        workload_id = max(event["connection_id"] for event in accepted)
+                        if any(
+                            event["connection_id"] == workload_id
+                            for event in timed_out_closes(events, "connect_timeout")
+                        ):
+                            outcome = "timed_out"
+                        elif any(
+                            event["connection_id"] == workload_id
+                            for event in events_named(events, "upstream_connected")
+                        ):
+                            outcome = "connected"
+                    if outcome is None:
+                        time.sleep(0.05)
+
+                if outcome == "connected":
+                    return {
+                        "scenario": "connect_timeout",
+                        "status": "skipped_environment",
+                        "reason": "kernel completed the handshake against a full accept queue",
+                    }
+                if outcome != "timed_out":
+                    raise AssertionError("neither connect_timeout nor upstream_connected was observed")
+
                 try:
-                    outcome = sock.recv(4096)
-                    if outcome != b"":
-                        raise AssertionError(f"expected EOF after connect timeout, got {outcome!r}")
+                    trailing = sock.recv(4096)
+                    if trailing != b"":
+                        raise AssertionError(f"expected EOF after connect timeout, got {trailing!r}")
                 except ConnectionResetError:
                     pass
             elapsed = time.monotonic() - started
             if elapsed < 0.35 or elapsed > 8.0:
                 raise AssertionError(f"connect timeout at an implausible time: {elapsed:.3f}s")
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if timed_out_closes(read_events(proxy_log), "connect_timeout"):
-                    break
-                time.sleep(0.05)
         finally:
             if proxy is not None:
                 stop_process(proxy)

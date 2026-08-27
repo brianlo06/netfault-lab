@@ -16,6 +16,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends catch2 cmake ninja-build
+      - name: Disable TCP syncookies for the connect-timeout scenario
+        run: sudo sysctl -w net.ipv4.tcp_syncookies=0
       - name: Configure
         run: cmake --preset asan-ubsan
       - name: Build
@@ -33,6 +35,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends catch2 cmake ninja-build
+      - name: Disable TCP syncookies for the connect-timeout scenario
+        run: sudo sysctl -w net.ipv4.tcp_syncookies=0
       - name: Configure
         run: cmake --preset tsan
       - name: Build
