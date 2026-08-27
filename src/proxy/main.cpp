@@ -64,6 +64,8 @@ Options:
                             (default 0 = disabled)
   --idle-timeout-ms N      Close connections with no transfer for N ms
                             (default 0 = disabled)
+  --metrics-file PATH      Atomically write a JSON metrics document to PATH on
+                            SIGUSR1 and at shutdown (default: disabled)
 
 Fault injection (deterministic; reproducible from the same seed):
   --fault-seed N           Master seed for all fault randomness (default 0)
@@ -133,6 +135,8 @@ int main(int argc, char** argv) {
         config.connect_timeout = std::chrono::milliseconds{parse_size(require_value(), "connect_timeout_ms")};
       } else if (argument == "--idle-timeout-ms") {
         config.idle_timeout = std::chrono::milliseconds{parse_size(require_value(), "idle_timeout_ms")};
+      } else if (argument == "--metrics-file") {
+        config.metrics_file = std::string{require_value()};
       } else if (argument == "--fault-seed") {
         config.faults.master_seed = parse_size(require_value(), "fault_seed");
       } else if (argument == "--fault-probability") {

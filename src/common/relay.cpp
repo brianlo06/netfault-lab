@@ -358,4 +358,49 @@ std::string Relay::close_detail(TimePoint now) const {
   return detail;
 }
 
+std::string Relay::metrics_json(TimePoint now) const {
+  const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - accepted_at_).count();
+  std::string json = "{";
+  const auto field = [&json](std::string_view name, std::uint64_t value, bool first = false) {
+    if (!first) {
+      json += ",";
+    }
+    json += "\"" + std::string{name} + "\":" + std::to_string(value);
+  };
+  json += "\"state\":\"" + std::string{state_name(state_)} + "\"";
+  field("duration_ms", static_cast<std::uint64_t>(duration));
+  field("client_bytes_read", metrics_.client_bytes_read);
+  field("upstream_bytes_read", metrics_.upstream_bytes_read);
+  field("client_bytes_written", metrics_.client_bytes_written);
+  field("upstream_bytes_written", metrics_.upstream_bytes_written);
+  field("read_operations", metrics_.read_operations);
+  field("write_operations", metrics_.write_operations);
+  field("partial_writes", metrics_.partial_writes);
+  field("eagain_events", metrics_.eagain_events);
+  field("faults_applied", faults_active_ ? 1 : 0);
+  const auto append_direction = [&](std::string_view prefix, const Direction& direction) {
+    const auto& tracker = direction.backpressure;
+    field(std::string{prefix} + "_queue_bytes", direction.queue.size());
+    field(std::string{prefix} + "_high_water", direction.queue.high_water_mark());
+    field(std::string{prefix} + "_pause_count", tracker.pause_count());
+    field(std::string{prefix} + "_resume_count", tracker.resume_count());
+    field(std::string{prefix} + "_saturation_count", tracker.saturation_count());
+    field(std::string{prefix} + "_paused_us",
+          static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::microseconds>(tracker.paused_duration(now)).count()));
+    field(std::string{prefix} + "_delayed_segments",
+          direction.fault ? direction.fault->delayed_segments : 0);
+    field(std::string{prefix} + "_delay_budget_us",
+          direction.fault
+              ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               direction.fault->delay_budget)
+                                               .count())
+              : 0);
+  };
+  append_direction("c2u", client_to_upstream_);
+  append_direction("u2c", upstream_to_client_);
+  json += "}";
+  return json;
+}
+
 }  // namespace netfault

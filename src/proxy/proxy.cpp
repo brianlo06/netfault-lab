@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -177,6 +178,7 @@ class ProxyRuntime {
             stopping = true;
           } else if (signal_info.ssi_signo == SIGUSR1) {
             emit_metrics_snapshot();
+            write_metrics_file();
           } else {
             stopping = true;
           }
@@ -195,6 +197,7 @@ class ProxyRuntime {
       close_connection(connections_.begin()->first, ConnectionState::FullyClosed, "proxy_shutdown",
                        shutdown_now);
     }
+    write_metrics_file();
     logger_.event("proxy_stopped", 0, "fully_closed",
                   "dropped_log_events=" + std::to_string(logger_.dropped_events()));
     return 0;
@@ -290,6 +293,74 @@ class ProxyRuntime {
         }
       }
     }
+  }
+
+  // Builds the exported JSON document from event-loop-owned values. All
+  // fields are numeric or fixed identifiers; payload bytes never appear.
+  [[nodiscard]] std::string build_metrics_json() const {
+    const auto now = std::chrono::steady_clock::now();
+    const auto wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+    std::string json = "{";
+    json += "\"timestamp_ms\":" + std::to_string(wall_ms);
+    json += ",\"listen\":\"" + config_.listen.to_string() + "\"";
+    json += ",\"upstream\":\"" + config_.upstream.to_string() + "\"";
+    json += ",\"active_connections\":" + std::to_string(connections_.size());
+    json += ",\"total_accepted\":" + std::to_string(next_connection_id_ - 1);
+    json += ",\"pending_timers\":" + std::to_string(timer_queue_.size());
+    json += ",\"dropped_log_events\":" + std::to_string(logger_.dropped_events());
+    json += ",\"closes\":{";
+    json += "\"fully_closed\":" + std::to_string(closes_fully_closed_);
+    json += ",\"reset\":" + std::to_string(closes_reset_);
+    json += ",\"failed\":" + std::to_string(closes_failed_);
+    json += ",\"timed_out\":" + std::to_string(closes_timed_out_);
+    json += "},\"connections\":[";
+    bool first = true;
+    for (const auto& [connection_id, connection] : connections_) {
+      if (!first) {
+        json += ",";
+      }
+      first = false;
+      json += "{\"id\":" + std::to_string(connection_id) + ",";
+      const auto body = connection->relay.metrics_json(now);
+      json += body.substr(1);  // splice the relay object's fields after "id"
+    }
+    json += "]}";
+    return json;
+  }
+
+  // Atomic export: write a sibling temporary file, then rename over the
+  // target, so readers never observe a partially-written document.
+  void write_metrics_file() const {
+    if (config_.metrics_file.empty()) {
+      return;
+    }
+    const auto temporary_path = config_.metrics_file + ".tmp";
+    const auto json = build_metrics_json() + "\n";
+    UniqueFd fd{::open(temporary_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644)};
+    if (!fd) {
+      logger_.event("metrics_file_failed", 0, "failed", "open=" + std::string{std::strerror(errno)});
+      return;
+    }
+    std::size_t offset = 0;
+    while (offset < json.size()) {
+      const auto written = ::write(fd.get(), json.data() + offset, json.size() - offset);
+      if (written < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        logger_.event("metrics_file_failed", 0, "failed", "write=" + std::string{std::strerror(errno)});
+        return;
+      }
+      offset += static_cast<std::size_t>(written);
+    }
+    fd.reset();
+    if (std::rename(temporary_path.c_str(), config_.metrics_file.c_str()) != 0) {
+      logger_.event("metrics_file_failed", 0, "failed", "rename=" + std::string{std::strerror(errno)});
+      return;
+    }
+    logger_.event("metrics_file_written", 0, "listening", "bytes=" + std::to_string(json.size()));
   }
 
   // Copies event-loop-owned counters into log events on demand. No payload
@@ -530,6 +601,20 @@ class ProxyRuntime {
     bindings_.erase(connection.upstream_token);
     detail += connection.relay.close_detail(now);
     logger_.event("connection_closed", connection.id, state_name(final_state), detail);
+    switch (final_state) {
+      case ConnectionState::Reset:
+        ++closes_reset_;
+        break;
+      case ConnectionState::Failed:
+        ++closes_failed_;
+        break;
+      case ConnectionState::TimedOut:
+        ++closes_timed_out_;
+        break;
+      default:
+        ++closes_fully_closed_;
+        break;
+    }
     connections_.erase(iterator);
   }
 
@@ -544,6 +629,10 @@ class ProxyRuntime {
   TimerQueue timer_queue_;
   std::uint64_t next_connection_id_{1};
   std::uint64_t next_token_{4};
+  std::uint64_t closes_fully_closed_{0};
+  std::uint64_t closes_reset_{0};
+  std::uint64_t closes_failed_{0};
+  std::uint64_t closes_timed_out_{0};
   std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
   std::unordered_map<std::uint64_t, SocketBinding> bindings_;
 };

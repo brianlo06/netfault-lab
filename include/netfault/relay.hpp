@@ -113,6 +113,11 @@ class Relay {
   // Key/value counters appended to the connection_closed log event.
   [[nodiscard]] std::string close_detail(TimePoint now) const;
 
+  // The same counters as a JSON object body (without braces' surrounding
+  // whitespace concerns): all values numeric or fixed identifiers, no payload
+  // data, suitable for the exported metrics document.
+  [[nodiscard]] std::string metrics_json(TimePoint now) const;
+
  private:
   struct FaultChannel {
     std::optional<DelayLine> delay;
