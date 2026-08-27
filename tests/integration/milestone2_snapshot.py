@@ -32,7 +32,9 @@ def main() -> int:
 
     server_port = free_port()
     proxy_port = free_port()
-    payload_bytes = 512 * 1024
+    # The slow reader takes >= 3 ms per 4 KiB chunk, so 2 MiB has a ~1.5 s
+    # floor on any machine, comfortably outlasting the 0.5 s sample point.
+    payload_bytes = 2 * 1024 * 1024
     environment = default_environment()
 
     with tempfile.TemporaryFile(mode="w+") as server_log, tempfile.TemporaryFile(mode="w+") as proxy_log:

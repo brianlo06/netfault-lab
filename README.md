@@ -2,7 +2,7 @@
 
 NetFault Lab is a Linux/C++20 workbench for reproducing and explaining TCP failure behavior in isolated, authorized test environments.
 
-> **Milestone 3 status:** the repository implements loopback-safe, nonblocking, bidirectional TCP forwarding with Linux `epoll`, fixed-capacity per-direction buffers with configurable watermarks, orderly half-close propagation, deterministic seeded fault injection (latency/jitter, token-bucket rate limits, reset and half-close injection), timerfd-driven connect/idle timeouts, structured connection logs, a `SIGUSR1` metrics snapshot, a controlled multi-mode server, a deterministic binary client, fake-clock unit tests, fault-scenario integration tests, and a Linux container test. YAML configuration, benchmark claims, and the dashboard are not implemented yet.
+> **Milestone 4 status:** the repository implements loopback-safe, nonblocking, bidirectional TCP forwarding with Linux `epoll`, fixed-capacity per-direction buffers with configurable watermarks, orderly half-close propagation, deterministic seeded fault injection (latency/jitter, token-bucket rate limits, reset and half-close injection), timerfd-driven connect/idle timeouts, structured connection logs, an atomically written JSON metrics export, a request-response benchmark client with reproducible pooled latency percentiles, a controlled multi-mode server, fake-clock unit tests, fault-scenario integration tests, a Linux container test, and GitHub Actions CI under ASan/UBSan and TSan. YAML configuration, absolute performance claims, and the dashboard are not implemented yet.
 
 ## Safety first
 
@@ -29,7 +29,7 @@ Each connection pairs its two sockets with a `Relay`: the forwarding engine that
 
 Fault injection composes over this engine rather than branching inside socket code: each direction may carry a delay line (latency/jitter segments over the same bounded queue, so delay creates no hidden storage) and a token bucket, while lifecycle faults (reset, injected half-close) trigger on forwarded-byte budgets. A destination blocked purely on time suppresses `EPOLLOUT` and reports its earliest useful wake time; one `CLOCK_MONOTONIC` timerfd, armed from a min-heap of `(deadline, sequence)` entries, drives those wakes plus connect/idle timeouts. All fault randomness derives from one master seed through documented SplitMix64 mixing, so runs are reproducible.
 
-The full design, state model, assumptions, risk register, and milestone plan are in [docs/milestone-0-design.md](docs/milestone-0-design.md). Milestone execution evidence is recorded in [docs/milestone-1-report.md](docs/milestone-1-report.md), [docs/milestone-2-report.md](docs/milestone-2-report.md), and [docs/milestone-3-report.md](docs/milestone-3-report.md).
+The full design, state model, assumptions, risk register, and milestone plan are in [docs/milestone-0-design.md](docs/milestone-0-design.md). Milestone execution evidence is recorded in [docs/milestone-1-report.md](docs/milestone-1-report.md), [docs/milestone-2-report.md](docs/milestone-2-report.md), [docs/milestone-3-report.md](docs/milestone-3-report.md), and [docs/milestone-4-report.md](docs/milestone-4-report.md).
 
 ## Build and test
 
@@ -76,6 +76,15 @@ To observe backpressure, run the server with `--mode slow-reader --delay-ms 2 --
 
 To observe fault injection, add for example `--fault-latency-ms 200 --fault-jitter-ms 50 --fault-seed 42`: the client's transfer time jumps by the round-trip delay, and the close event records the delayed segment count and delay budget. `--fault-rate-bytes-per-sec` throttles a direction, `--fault-reset-after-bytes` and `--fault-half-close-after-bytes` inject lifecycle failures, and `--fault-probability 0.5` applies the plan to a reproducible seed-derived subset of connections (each decision is logged as `fault_config`). `--connect-timeout-ms` and `--idle-timeout-ms` close hung or quiet connections in a distinct `timed_out` state.
 
+To measure instead of stream, run the client in benchmark mode against the proxy:
+
+```bash
+build/debug/netfault-client --connect 127.0.0.1:8080 \
+  --mode request-response --connections 2 --requests 100 --request-bytes 1024
+```
+
+The summary reports pooled nearest-rank latency percentiles plus the full configuration, seed, and environment (methodology in the [Milestone 4 report](docs/milestone-4-report.md)). Add `--metrics-file /path/metrics.json` to the proxy to export an atomically written JSON metrics document on `SIGUSR1` and at shutdown.
+
 ## Current behavior
 
 - Numeric IPv4 endpoints only; DNS and IPv6 are intentionally deferred.
@@ -92,10 +101,9 @@ To observe fault injection, add for example `--fault-latency-ms 200 --fault-jitt
 
 ## Known limitations
 
-- No YAML parser, stall faults, latency percentiles, benchmark runner, or dashboard yet.
-- Metrics snapshots are delivered as log events; there is no queryable endpoint.
+- No YAML parser, stall faults, metrics endpoint (the export is an on-demand file), or dashboard yet.
 - Faults are proxy-global: every fault-applied connection receives the same plan.
-- The client measures total connection transfer duration, not request/response latency distributions.
+- The benchmark measures sequential request/response only; no pipelining or open-loop load, and no absolute performance numbers are published.
 - The proxy uses IPv4 and level-triggered `epoll` only.
 
 ## Roadmap
@@ -103,8 +111,8 @@ To observe fault injection, add for example `--fault-latency-ms 200 --fault-jitt
 1. Basic TCP forwarding — complete ([report](docs/milestone-1-report.md)).
 2. Bounded-buffer/backpressure metrics and saturation tests — complete ([report](docs/milestone-2-report.md)).
 3. Nonblocking latency/jitter, token-bucket bandwidth, half-close/reset fault policies, timeouts, and deterministic seeding — complete ([report](docs/milestone-3-report.md)).
-4. Metrics export and reproducible benchmark harness — next milestone.
-5. Sanitizer/stress CI, containers, packet-capture comparison, and professional documentation.
+4. Metrics export and reproducible benchmark harness — complete ([report](docs/milestone-4-report.md)).
+5. Sanitizer/stress CI, containers, packet-capture comparison, and professional documentation — next milestone (CI is already running).
 6. Optional dashboard and thread-per-connection comparison.
 
 No performance numbers will be published until the benchmark methodology is implemented and run.
