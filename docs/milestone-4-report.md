@@ -39,9 +39,12 @@ All runs used the Ubuntu 24.04 container (GCC 13.3.0, full warning set with `-We
 | Memory errors/leaks in executed paths | No findings | Three consecutive full ASan+UBSan suites (10 tests) passed |
 | Thread data races in executed paths | No findings | TSan suite passed |
 
-### Flake found and fixed during this milestone
+### Flakes found and fixed during this milestone
 
-The first CI run on GitHub-hosted runners failed the Milestone 2 snapshot test: its 512 KiB transfer through the 3 ms/4 KiB slow reader has a ~384 ms duration floor, shorter than the 500 ms `SIGUSR1` sample point — it had passed locally only because sanitizer-container overhead stretched the transfer. The payload is now 2 MiB (~1.5 s floor on any machine). The same margin analysis was applied to the new Milestone 4 metrics test (1 MiB floor ≈ 768 ms against a 300 ms sample point).
+Bringing the suite to GitHub-hosted runners surfaced two environment dependencies the local container had masked:
+
+1. **Timing margins.** The Milestone 2 snapshot test's 512 KiB transfer through the 3 ms/4 KiB slow reader has a ~384 ms duration floor, shorter than its 500 ms `SIGUSR1` sample point — it had passed locally only because sanitizer-container overhead stretched the transfer. The payload is now 2 MiB (~1.5 s floor on any machine), and the same analysis was applied to the new metrics test.
+2. **Kernel TCP overflow behavior.** The connect-timeout scenario hangs the proxy's upstream connect by saturating a never-accepting listener's queue, relying on the kernel dropping SYNs to a full accept queue. Runners exhibited two other legitimate behaviors: with `tcp_syncookies=1` the handshake can complete against the full queue while the server silently drops the child (the proxy sees a connected upstream), and the queue can answer with RST so the connect fails instantly (never accepted at all). The scenario now watches the workload connection's fate in the log — asserting the strict `timed_out` path when the connect hangs and reporting itself environment-skipped for the other two outcomes — and CI pins `tcp_syncookies=0` and `tcp_abort_on_overflow=0` so the strict path runs there.
 
 ## Known limitations
 
