@@ -95,4 +95,15 @@ if(BUILD_TESTING)
     )
     set_tests_properties(milestone2-${scenario} PROPERTIES TIMEOUT 120)
   endforeach()
+
+  foreach(scenario faults timeouts)
+    add_test(
+      NAME milestone3-${scenario}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/milestone3_${scenario}.py
+        --proxy $<TARGET_FILE:netfault-proxy>
+        --server $<TARGET_FILE:netfault-server>
+        --client $<TARGET_FILE:netfault-client>
+    )
+    set_tests_properties(milestone3-${scenario} PROPERTIES TIMEOUT 180)
+  endforeach()
 endif()

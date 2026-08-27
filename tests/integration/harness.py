@@ -96,19 +96,23 @@ def parse_detail(detail: str) -> dict[str, int | str]:
 def read_events(log: TextIO) -> list[dict[str, object]]:
     """Parse JSON Lines events, skipping a trailing line still being written.
 
-    Tests poll the log while the proxy is running, so the reader can observe a
-    partially-completed write(). Once the process has exited every line parses.
+    The subprocess writes through a dup of this file object's descriptor, so
+    both share one file description and one offset. Seeking the shared object
+    would rewind the writer and make its next line overwrite the log, so the
+    read goes through an independent file description on the same inode
+    (Linux-only, like these tests). A partially-completed trailing write()
+    can still be observed mid-poll; once the process has exited every line
+    parses.
     """
-    log.flush()
-    log.seek(0)
     events = []
-    for line in log:
-        if not line.strip():
-            continue
-        try:
-            events.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+    with open(f"/proc/self/fd/{log.fileno()}", "r", encoding="utf-8") as reader:
+        for line in reader:
+            if not line.strip():
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     return events
 
 
