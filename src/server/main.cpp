@@ -7,8 +7,10 @@
 #include <signal.h>
 #include <sys/socket.h>
 
+#include <algorithm>
 #include <chrono>
 #include <charconv>
+#include <span>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -22,12 +24,13 @@ namespace {
 
 volatile sig_atomic_t stop_requested = 0;
 
-enum class ServerMode { Echo, SlowReader, SlowWriter };
+enum class ServerMode { Echo, SlowReader, SlowWriter, ReadUntilEof, SendThenHalfClose };
 
 struct ServerConfig {
   ServerMode mode{ServerMode::Echo};
   std::chrono::milliseconds delay{0};
   std::size_t chunk_bytes{16'384};
+  std::size_t send_bytes{65'536};
 };
 
 extern "C" void handle_signal(int /*signal*/) { stop_requested = 1; }
@@ -64,11 +67,53 @@ bool send_all(int fd, const std::byte* data, std::size_t size, std::stop_token s
   return offset == size;
 }
 
+// Reads and discards until EOF, then closes without ever echoing. Exercises the
+// client-initiated half-close path end to end.
+void drain_until_eof(std::stop_token stop_token, int fd, std::span<std::byte> buffer) {
+  while (!stop_token.stop_requested()) {
+    const auto count = ::recv(fd, buffer.data(), buffer.size(), 0);
+    if (count > 0) {
+      continue;
+    }
+    if (count == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+      return;
+    }
+  }
+}
+
+// Sends a deterministic payload, half-closes the write side first, then drains
+// whatever the peer still sends. Exercises the upstream-initiated half-close path.
+void send_then_half_close(std::stop_token stop_token, int fd, std::span<std::byte> buffer,
+                          const ServerConfig& config) {
+  std::size_t remaining = config.send_bytes;
+  for (std::size_t index = 0; index < buffer.size(); ++index) {
+    buffer[index] = static_cast<std::byte>(index & 0xFFU);
+  }
+  while (remaining > 0 && !stop_token.stop_requested()) {
+    const auto request_bytes = std::min(remaining, buffer.size());
+    if (!send_all(fd, buffer.data(), request_bytes, stop_token, config)) {
+      return;
+    }
+    remaining -= request_bytes;
+  }
+  static_cast<void>(::shutdown(fd, SHUT_WR));
+  drain_until_eof(stop_token, fd, buffer);
+}
+
 void serve_client(std::stop_token stop_token, netfault::UniqueFd client, ServerConfig config) {
   timeval timeout{1, 0};
   static_cast<void>(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
   static_cast<void>(::setsockopt(client.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
   std::vector<std::byte> buffer(config.chunk_bytes);
+  if (config.mode == ServerMode::ReadUntilEof) {
+    drain_until_eof(stop_token, client.get(), buffer);
+    static_cast<void>(::shutdown(client.get(), SHUT_WR));
+    return;
+  }
+  if (config.mode == ServerMode::SendThenHalfClose) {
+    send_then_half_close(stop_token, client.get(), buffer, config);
+    return;
+  }
   while (!stop_token.stop_requested()) {
     if (config.mode == ServerMode::SlowReader && !interruptible_delay(stop_token, config.delay)) {
       return;
@@ -99,10 +144,12 @@ void print_help() {
 
 Usage:
   netfault-server [--listen 127.0.0.1:9000]
-                  [--mode echo|slow-reader|slow-writer]
-                  [--delay-ms N] [--chunk-bytes N]
+                  [--mode echo|slow-reader|slow-writer|read-until-eof|send-then-half-close]
+                  [--delay-ms N] [--chunk-bytes N] [--send-bytes N]
 
-Slow modes delay every read or write operation. Only loopback listeners are allowed.
+Slow modes delay every read or write operation. read-until-eof discards input and
+closes after the peer half-closes. send-then-half-close sends --send-bytes, half-closes
+its write side first, then drains input. Only loopback listeners are allowed.
 )";
 }
 
@@ -125,7 +172,14 @@ ServerMode parse_mode(std::string_view mode) {
   if (mode == "slow-writer") {
     return ServerMode::SlowWriter;
   }
-  throw std::invalid_argument("mode must be echo, slow-reader, or slow-writer");
+  if (mode == "read-until-eof") {
+    return ServerMode::ReadUntilEof;
+  }
+  if (mode == "send-then-half-close") {
+    return ServerMode::SendThenHalfClose;
+  }
+  throw std::invalid_argument(
+      "mode must be echo, slow-reader, slow-writer, read-until-eof, or send-then-half-close");
 }
 
 std::string_view mode_name(ServerMode mode) {
@@ -136,6 +190,10 @@ std::string_view mode_name(ServerMode mode) {
       return "slow-reader";
     case ServerMode::SlowWriter:
       return "slow-writer";
+    case ServerMode::ReadUntilEof:
+      return "read-until-eof";
+    case ServerMode::SendThenHalfClose:
+      return "send-then-half-close";
   }
   return "unknown";
 }
@@ -167,6 +225,8 @@ int main(int argc, char** argv) {
         config.delay = std::chrono::milliseconds{parse_size(require_value(), "delay_ms", true)};
       } else if (argument == "--chunk-bytes") {
         config.chunk_bytes = parse_size(require_value(), "chunk_bytes");
+      } else if (argument == "--send-bytes") {
+        config.send_bytes = parse_size(require_value(), "send_bytes");
       } else {
         throw std::invalid_argument("unknown argument: " + std::string{argument});
       }
@@ -176,6 +236,9 @@ int main(int argc, char** argv) {
     }
     if (config.delay > std::chrono::seconds{60} || config.chunk_bytes > 1U * 1'024U * 1'024U) {
       throw std::invalid_argument("delay must be at most 60000 ms and chunk size at most 1048576 bytes");
+    }
+    if (config.send_bytes > 16U * 1'024U * 1'024U) {
+      throw std::invalid_argument("send_bytes must be at most 16777216");
     }
 
     ::signal(SIGINT, handle_signal);

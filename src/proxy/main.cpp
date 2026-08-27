@@ -32,6 +32,10 @@ Options:
   --buffer-bytes N         Fixed bytes per direction/connection (default 65536)
   --low-water-bytes N      Resume reads at or below this occupancy (default 32768)
   --high-water-bytes N     Pause reads at this occupancy (default 65536)
+  --socket-buffer-bytes N  Set SO_SNDBUF/SO_RCVBUF on upstream sockets; small
+                            values constrain the upstream path and force
+                            partial writes for testing (default: kernel
+                            default)
   --unsafe-allow-non-loopback-listen
                             Permit a non-loopback listener after a warning
   --unsafe-allow-non-loopback-upstream
@@ -79,6 +83,8 @@ int main(int argc, char** argv) {
       } else if (argument == "--high-water-bytes") {
         config.high_water_bytes = parse_size(require_value(), "high_water_bytes");
         high_water_was_set = true;
+      } else if (argument == "--socket-buffer-bytes") {
+        config.socket_buffer_bytes = parse_size(require_value(), "socket_buffer_bytes");
       } else if (argument == "--unsafe-allow-non-loopback-listen") {
         config.allow_non_loopback_listen = true;
       } else if (argument == "--unsafe-allow-non-loopback-upstream") {

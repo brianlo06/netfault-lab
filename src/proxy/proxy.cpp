@@ -95,7 +95,8 @@ UniqueFd create_listener(const Endpoint& endpoint, std::size_t max_connections) 
 
 UniqueFd create_signal_fd() {
   sigset_t mask{};
-  if (::sigemptyset(&mask) < 0 || ::sigaddset(&mask, SIGINT) < 0 || ::sigaddset(&mask, SIGTERM) < 0) {
+  if (::sigemptyset(&mask) < 0 || ::sigaddset(&mask, SIGINT) < 0 || ::sigaddset(&mask, SIGTERM) < 0 ||
+      ::sigaddset(&mask, SIGUSR1) < 0) {
     throw std::runtime_error("could not initialize signal mask");
   }
   if (::sigprocmask(SIG_BLOCK, &mask, nullptr) < 0) {
@@ -150,8 +151,12 @@ class ProxyRuntime {
           } while (bytes_read < 0 && errno == EINTR);
           if (bytes_read != static_cast<ssize_t>(sizeof(signal_info))) {
             logger_.event("signal_read_incomplete", 0, "failed", std::strerror(errno));
+            stopping = true;
+          } else if (signal_info.ssi_signo == SIGUSR1) {
+            emit_metrics_snapshot();
+          } else {
+            stopping = true;
           }
-          stopping = true;
         } else {
           socket_ready(token, event_mask);
         }
@@ -196,6 +201,32 @@ class ProxyRuntime {
     return events;
   }
 
+  // Copies event-loop-owned counters into log events on demand. No payload
+  // bytes are ever included; only sizes, counts, and durations.
+  void emit_metrics_snapshot() {
+    logger_.event("metrics_snapshot", 0, "listening",
+                  "active_connections=" + std::to_string(connections_.size()) +
+                      ",total_accepted=" + std::to_string(next_connection_id_ - 1) +
+                      ",dropped_log_events=" + std::to_string(logger_.dropped_events()));
+    for (const auto& [connection_id, connection] : connections_) {
+      logger_.event("connection_snapshot", connection_id, state_name(connection->relay.state()),
+                    "snapshot=1" + connection->relay.close_detail());
+    }
+  }
+
+  // Applied to the upstream socket only: it constrains the upstream path while
+  // client-side flow stays at kernel defaults, so proxy queues genuinely fill.
+  void apply_socket_buffer_size(int fd) const {
+    if (config_.socket_buffer_bytes == 0) {
+      return;
+    }
+    const int size = static_cast<int>(config_.socket_buffer_bytes);
+    if (::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size)) < 0 ||
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) < 0) {
+      logger_.event("socket_buffer_resize_failed", 0, "failed", std::strerror(errno));
+    }
+  }
+
   void accept_ready() {
     while (true) {
       UniqueFd client{::accept4(listener_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC)};
@@ -220,6 +251,7 @@ class ProxyRuntime {
         logger_.event("upstream_socket_failed", 0, "failed", std::strerror(errno));
         continue;
       }
+      apply_socket_buffer_size(upstream.get());
 
       const auto upstream_address = config_.upstream.to_sockaddr();
       const int connect_result = ::connect(upstream.get(), reinterpret_cast<const sockaddr*>(&upstream_address),
@@ -372,6 +404,10 @@ Proxy::Proxy(ProxyConfig config) : config_(std::move(config)) {
   if (config_.low_water_bytes >= config_.high_water_bytes ||
       config_.high_water_bytes > config_.buffer_bytes_per_direction) {
     throw std::invalid_argument("watermarks must satisfy 0 <= low_water_bytes < high_water_bytes <= buffer_bytes");
+  }
+  if (config_.socket_buffer_bytes != 0 &&
+      (config_.socket_buffer_bytes < 1'024 || config_.socket_buffer_bytes > 1'024U * 1'024U)) {
+    throw std::invalid_argument("socket_buffer_bytes must be 0 (kernel default) or between 1024 and 1048576");
   }
   if (!config_.listen.is_loopback() && !config_.allow_non_loopback_listen) {
     throw std::invalid_argument("non-loopback listen requires --unsafe-allow-non-loopback-listen");

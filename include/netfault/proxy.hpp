@@ -14,6 +14,7 @@ struct ProxyConfig {
   std::size_t buffer_bytes_per_direction{65'536};
   std::size_t low_water_bytes{32'768};
   std::size_t high_water_bytes{65'536};
+  std::size_t socket_buffer_bytes{0};  // 0 keeps the kernel default; small values force partial writes
   bool allow_non_loopback_listen{false};
   bool allow_non_loopback_upstream{false};
 };

@@ -80,4 +80,15 @@ if(BUILD_TESTING)
       --client $<TARGET_FILE:netfault-client>
   )
   set_tests_properties(milestone2-backpressure PROPERTIES TIMEOUT 45)
+
+  foreach(scenario faults snapshot churn)
+    add_test(
+      NAME milestone2-${scenario}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/milestone2_${scenario}.py
+        --proxy $<TARGET_FILE:netfault-proxy>
+        --server $<TARGET_FILE:netfault-server>
+        --client $<TARGET_FILE:netfault-client>
+    )
+    set_tests_properties(milestone2-${scenario} PROPERTIES TIMEOUT 120)
+  endforeach()
 endif()
