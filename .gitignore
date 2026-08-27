@@ -1,0 +1,6 @@
+/build/
+/benchmarks/raw/
+*.pcap
+*.pcapng
+*.log
+.DS_Store

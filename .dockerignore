@@ -1,0 +1,4 @@
+.git
+build
+benchmarks/raw
+dashboard/node_modules
