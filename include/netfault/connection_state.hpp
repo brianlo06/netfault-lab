@@ -13,6 +13,7 @@ enum class ConnectionState {
   FullyClosed,
   Reset,
   Failed,
+  TimedOut,
 };
 
 struct ConnectionLifecycle {
@@ -55,6 +56,8 @@ struct ConnectionLifecycle {
       return "reset";
     case ConnectionState::Failed:
       return "failed";
+    case ConnectionState::TimedOut:
+      return "timed_out";
   }
   return "unknown";
 }

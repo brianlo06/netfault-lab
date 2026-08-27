@@ -1,9 +1,11 @@
 #include "netfault/proxy.hpp"
 
 #include "netfault/connection_state.hpp"
+#include "netfault/fault_rng.hpp"
 #include "netfault/logger.hpp"
 #include "netfault/relay.hpp"
 #include "netfault/socket_io.hpp"
+#include "netfault/timer_queue.hpp"
 #include "netfault/unique_fd.hpp"
 
 #include <arpa/inet.h>
@@ -14,13 +16,16 @@
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -28,8 +33,11 @@
 namespace netfault {
 namespace {
 
+using TimePoint = std::chrono::steady_clock::time_point;
+
 constexpr std::uint64_t kListenerToken = 1;
 constexpr std::uint64_t kSignalToken = 2;
+constexpr std::uint64_t kTimerToken = 3;
 constexpr int kMaxEvents = 128;
 
 // Forwards relay events into the shared JSON Lines logger under one connection id.
@@ -49,18 +57,21 @@ class ConnectionLogObserver final : public RelayObserver {
 
 struct Connection {
   Connection(std::uint64_t connection_id, UniqueFd client_socket, UniqueFd upstream_socket,
-             bool upstream_connecting, const RelayConfig& relay_config, SocketIo& io, const Logger& logger)
+             bool upstream_connecting, const RelayConfig& relay_config, const FaultPlan& faults,
+             SocketIo& io, const Logger& logger, TimePoint now)
       : id(connection_id),
         client_fd(std::move(client_socket)),
         upstream_fd(std::move(upstream_socket)),
         observer(logger, connection_id),
-        relay(relay_config, client_fd.get(), upstream_fd.get(), upstream_connecting, io, observer) {}
+        relay(relay_config, faults, connection_id, client_fd.get(), upstream_fd.get(),
+              upstream_connecting, io, observer, now) {}
 
   std::uint64_t id;
   UniqueFd client_fd;
   UniqueFd upstream_fd;
   std::uint64_t client_token{0};
   std::uint64_t upstream_token{0};
+  std::optional<TimePoint> scheduled_wake;
   ConnectionLogObserver observer;
   Relay relay;
 };
@@ -109,18 +120,30 @@ UniqueFd create_signal_fd() {
   return fd;
 }
 
+// std::chrono::steady_clock is CLOCK_MONOTONIC on the supported Linux/glibc
+// target, so heap deadlines arm the timerfd in absolute monotonic time.
+UniqueFd create_timer_fd() {
+  UniqueFd fd{::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC)};
+  if (!fd) {
+    throw std::runtime_error("timerfd_create: " + std::string{std::strerror(errno)});
+  }
+  return fd;
+}
+
 class ProxyRuntime {
  public:
   explicit ProxyRuntime(ProxyConfig config)
       : config_(std::move(config)),
         listener_(create_listener(config_.listen, config_.max_connections)),
         signal_fd_(create_signal_fd()),
+        timer_fd_(create_timer_fd()),
         epoll_fd_(::epoll_create1(EPOLL_CLOEXEC)) {
     if (!epoll_fd_) {
       throw std::runtime_error("epoll_create1: " + std::string{std::strerror(errno)});
     }
     add_epoll(listener_.get(), EPOLLIN, kListenerToken);
     add_epoll(signal_fd_.get(), EPOLLIN, kSignalToken);
+    add_epoll(timer_fd_.get(), EPOLLIN, kTimerToken);
   }
 
   int run() {
@@ -157,14 +180,20 @@ class ProxyRuntime {
           } else {
             stopping = true;
           }
+        } else if (token == kTimerToken) {
+          drain_timer_fd();
+          process_due_timers(std::chrono::steady_clock::now());
         } else {
           socket_ready(token, event_mask);
         }
       }
+      arm_timer_fd();
     }
 
+    const auto shutdown_now = std::chrono::steady_clock::now();
     while (!connections_.empty()) {
-      close_connection(connections_.begin()->first, ConnectionState::FullyClosed, "proxy_shutdown");
+      close_connection(connections_.begin()->first, ConnectionState::FullyClosed, "proxy_shutdown",
+                       shutdown_now);
     }
     logger_.event("proxy_stopped", 0, "fully_closed",
                   "dropped_log_events=" + std::to_string(logger_.dropped_events()));
@@ -201,21 +230,83 @@ class ProxyRuntime {
     return events;
   }
 
-  // Copies event-loop-owned counters into log events on demand. No payload
-  // bytes are ever included; only sizes, counts, and durations.
-  void emit_metrics_snapshot() {
-    logger_.event("metrics_snapshot", 0, "listening",
-                  "active_connections=" + std::to_string(connections_.size()) +
-                      ",total_accepted=" + std::to_string(next_connection_id_ - 1) +
-                      ",dropped_log_events=" + std::to_string(logger_.dropped_events()));
-    for (const auto& [connection_id, connection] : connections_) {
-      logger_.event("connection_snapshot", connection_id, state_name(connection->relay.state()),
-                    "snapshot=1" + connection->relay.close_detail());
+  void drain_timer_fd() {
+    std::uint64_t expirations = 0;
+    ssize_t bytes_read = -1;
+    do {
+      bytes_read = ::read(timer_fd_.get(), &expirations, sizeof(expirations));
+    } while (bytes_read < 0 && errno == EINTR);
+    // EAGAIN is fine: a rearm may have raced the expiration we were woken for.
+  }
+
+  void arm_timer_fd() {
+    const auto deadline = timer_queue_.next_deadline();
+    itimerspec spec{};
+    if (deadline) {
+      auto since_epoch = deadline->time_since_epoch();
+      if (since_epoch <= std::chrono::steady_clock::duration::zero()) {
+        since_epoch = std::chrono::steady_clock::duration{1};
+      }
+      const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(since_epoch);
+      const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(since_epoch - seconds);
+      spec.it_value.tv_sec = static_cast<time_t>(seconds.count());
+      spec.it_value.tv_nsec = static_cast<long>(nanoseconds.count());
+      if (spec.it_value.tv_sec == 0 && spec.it_value.tv_nsec == 0) {
+        spec.it_value.tv_nsec = 1;  // all-zero disarms; a past deadline must still fire
+      }
+    }
+    if (::timerfd_settime(timer_fd_.get(), TFD_TIMER_ABSTIME, &spec, nullptr) < 0) {
+      logger_.event("timer_arm_failed", 0, "failed", std::strerror(errno));
     }
   }
 
-  // Applied to the upstream socket only: it constrains the upstream path while
-  // client-side flow stays at kernel defaults, so proxy queues genuinely fill.
+  void process_due_timers(TimePoint now) {
+    while (auto event = timer_queue_.pop_due(now)) {
+      const auto iterator = connections_.find(event->connection_id);
+      if (iterator == connections_.end()) {
+        continue;  // stale entry for a removed connection; discarded lazily
+      }
+      Connection& connection = *iterator->second;
+      switch (event->kind) {
+        case TimerKind::Pump:
+          if (connection.scheduled_wake && *connection.scheduled_wake <= now) {
+            connection.scheduled_wake.reset();
+          }
+          pump_connection(connection.id, now);
+          break;
+        case TimerKind::ConnectTimeout:
+          if (connection.relay.upstream_connecting()) {
+            close_connection(connection.id, ConnectionState::TimedOut, "connect_timeout", now);
+          }
+          break;
+        case TimerKind::IdleTimeout: {
+          const auto idle_deadline = connection.relay.last_activity() + config_.idle_timeout;
+          if (now >= idle_deadline) {
+            close_connection(connection.id, ConnectionState::TimedOut, "idle_timeout", now);
+          } else {
+            timer_queue_.schedule(idle_deadline, connection.id, TimerKind::IdleTimeout);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  // Copies event-loop-owned counters into log events on demand. No payload
+  // bytes are ever included; only sizes, counts, and durations.
+  void emit_metrics_snapshot() {
+    const auto now = std::chrono::steady_clock::now();
+    logger_.event("metrics_snapshot", 0, "listening",
+                  "active_connections=" + std::to_string(connections_.size()) +
+                      ",total_accepted=" + std::to_string(next_connection_id_ - 1) +
+                      ",pending_timers=" + std::to_string(timer_queue_.size()) +
+                      ",dropped_log_events=" + std::to_string(logger_.dropped_events()));
+    for (const auto& [connection_id, connection] : connections_) {
+      logger_.event("connection_snapshot", connection_id, state_name(connection->relay.state()),
+                    "snapshot=1" + connection->relay.close_detail(now));
+    }
+  }
+
   void apply_socket_buffer_size(int fd) const {
     if (config_.socket_buffer_bytes == 0) {
       return;
@@ -225,6 +316,19 @@ class ProxyRuntime {
         ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size)) < 0) {
       logger_.event("socket_buffer_resize_failed", 0, "failed", std::strerror(errno));
     }
+  }
+
+  // Decides once at accept whether this connection receives the fault plan,
+  // sampling the derived connection seed so the choice is reproducible.
+  [[nodiscard]] bool faults_apply(std::uint64_t connection_id) const {
+    if (!config_.faults.any_enabled()) {
+      return false;
+    }
+    if (config_.faults.apply_probability >= 1.0) {
+      return true;
+    }
+    SplitMix64 rng{derive_connection_seed(config_.faults.master_seed, connection_id)};
+    return sample_unit_interval(rng.next()) < config_.faults.apply_probability;
   }
 
   void accept_ready() {
@@ -262,14 +366,18 @@ class ProxyRuntime {
         continue;
       }
 
+      const auto now = std::chrono::steady_clock::now();
       const auto connection_id = next_connection_id_++;
       const RelayConfig relay_config{
           .buffer_bytes_per_direction = config_.buffer_bytes_per_direction,
           .low_water_bytes = config_.low_water_bytes,
           .high_water_bytes = config_.high_water_bytes,
       };
+      const bool apply_faults = faults_apply(connection_id);
+      const FaultPlan& effective_faults = apply_faults ? config_.faults : disabled_faults_;
       auto connection = std::make_unique<Connection>(connection_id, std::move(client), std::move(upstream),
-                                                     connecting, relay_config, socket_io_, logger_);
+                                                     connecting, relay_config, effective_faults, socket_io_,
+                                                     logger_, now);
       connection->client_token = next_token_++;
       connection->upstream_token = next_token_++;
 
@@ -277,13 +385,24 @@ class ProxyRuntime {
       const int upstream_fd = connection->upstream_fd.get();
       bindings_.emplace(connection->client_token, SocketBinding{connection_id, Side::Client});
       bindings_.emplace(connection->upstream_token, SocketBinding{connection_id, Side::Upstream});
-      const auto& inserted = *connections_.emplace(connection_id, std::move(connection)).first->second;
-      add_epoll(client_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Client)), inserted.client_token);
-      add_epoll(upstream_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Upstream)),
+      auto& inserted = *connections_.emplace(connection_id, std::move(connection)).first->second;
+      add_epoll(client_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Client, now)),
+                inserted.client_token);
+      add_epoll(upstream_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Upstream, now)),
                 inserted.upstream_token);
       logger_.event("connection_accepted", connection_id, state_name(inserted.relay.state()));
+      if (config_.faults.any_enabled()) {
+        logger_.event("fault_config", connection_id, state_name(inserted.relay.state()),
+                      "applied=" + std::to_string(apply_faults ? 1 : 0) + ",seed=" +
+                          std::to_string(derive_connection_seed(config_.faults.master_seed, connection_id)));
+      }
       if (!connecting) {
         logger_.event("upstream_connected", connection_id, "active");
+      } else if (config_.connect_timeout.count() > 0) {
+        timer_queue_.schedule(now + config_.connect_timeout, connection_id, TimerKind::ConnectTimeout);
+      }
+      if (config_.idle_timeout.count() > 0) {
+        timer_queue_.schedule(now + config_.idle_timeout, connection_id, TimerKind::IdleTimeout);
       }
     }
   }
@@ -299,6 +418,7 @@ class ProxyRuntime {
       return;
     }
     Connection& connection = *connection_iterator->second;
+    const auto now = std::chrono::steady_clock::now();
 
     if (binding.side == Side::Upstream && connection.relay.upstream_connecting() && (events & EPOLLOUT) != 0U) {
       int socket_error = 0;
@@ -307,7 +427,7 @@ class ProxyRuntime {
           socket_error != 0) {
         const int error = socket_error != 0 ? socket_error : errno;
         close_connection(connection.id, ConnectionState::Failed,
-                         "upstream_connect=" + std::string{std::strerror(error)});
+                         "upstream_connect=" + std::string{std::strerror(error)}, now);
         return;
       }
       connection.relay.mark_upstream_connected();
@@ -321,7 +441,7 @@ class ProxyRuntime {
       if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &length) == 0 && socket_error != 0) {
         close_connection(connection.id,
                          socket_error == ECONNRESET ? ConnectionState::Reset : ConnectionState::Failed,
-                         std::strerror(socket_error));
+                         std::strerror(socket_error), now);
         return;
       }
     }
@@ -329,43 +449,76 @@ class ProxyRuntime {
     const bool readable_event = (events & (EPOLLIN | EPOLLRDHUP | EPOLLHUP)) != 0U;
     const bool hangup_hint = (events & (EPOLLRDHUP | EPOLLHUP)) != 0U;
     if (readable_event && !(binding.side == Side::Upstream && connection.relay.upstream_connecting())) {
-      const auto result = connection.relay.handle_readable(binding.side, hangup_hint);
+      const auto result = connection.relay.handle_readable(binding.side, hangup_hint, now);
       if (result.status == PumpStatus::CloseConnection) {
-        close_connection(connection.id, result.final_state, result.reason);
+        close_connection(connection.id, result.final_state, result.reason, now);
         return;
       }
     }
 
+    pump_connection(connection.id, now);
+  }
+
+  // Flushes both destinations, propagates half-closes, refreshes interests or
+  // closes, and schedules a fault wake if the relay is blocked on time.
+  void pump_connection(std::uint64_t connection_id, TimePoint now) {
+    const auto iterator = connections_.find(connection_id);
+    if (iterator == connections_.end()) {
+      return;
+    }
+    Connection& connection = *iterator->second;
     if (!connection.relay.upstream_connecting()) {
       for (const Side destination : {Side::Upstream, Side::Client}) {
-        const auto result = connection.relay.flush(destination);
+        const auto result = connection.relay.flush(destination, now);
         if (result.status == PumpStatus::CloseConnection) {
-          close_connection(connection.id, result.final_state, result.reason);
+          close_connection(connection.id, result.final_state, result.reason, now);
           return;
         }
       }
     }
     connection.relay.propagate_half_closes();
-    refresh_or_close(connection.id);
+    refresh_or_close(connection.id, now);
+    schedule_relay_wake(connection_id, now);
   }
 
-  void refresh_or_close(std::uint64_t connection_id) {
+  void schedule_relay_wake(std::uint64_t connection_id, TimePoint now) {
+    const auto iterator = connections_.find(connection_id);
+    if (iterator == connections_.end()) {
+      return;
+    }
+    Connection& connection = *iterator->second;
+    std::optional<TimePoint> wake;
+    for (const Side destination : {Side::Upstream, Side::Client}) {
+      const auto candidate = connection.relay.next_wake(destination, now);
+      if (candidate && (!wake || *candidate < *wake)) {
+        wake = candidate;
+      }
+    }
+    if (wake && (!connection.scheduled_wake || *wake < *connection.scheduled_wake)) {
+      timer_queue_.schedule(*wake, connection.id, TimerKind::Pump);
+      connection.scheduled_wake = *wake;
+    }
+  }
+
+  void refresh_or_close(std::uint64_t connection_id, TimePoint now) {
     const auto iterator = connections_.find(connection_id);
     if (iterator == connections_.end()) {
       return;
     }
     Connection& connection = *iterator->second;
     if (connection.relay.fully_drained()) {
-      close_connection(connection_id, ConnectionState::FullyClosed, "orderly_shutdown");
+      close_connection(connection_id, ConnectionState::FullyClosed, "orderly_shutdown", now);
       return;
     }
-    modify_epoll(connection.client_fd.get(), to_epoll_mask(connection.relay.desired_interest(Side::Client)),
-                 connection.client_token);
-    modify_epoll(connection.upstream_fd.get(), to_epoll_mask(connection.relay.desired_interest(Side::Upstream)),
+    modify_epoll(connection.client_fd.get(),
+                 to_epoll_mask(connection.relay.desired_interest(Side::Client, now)), connection.client_token);
+    modify_epoll(connection.upstream_fd.get(),
+                 to_epoll_mask(connection.relay.desired_interest(Side::Upstream, now)),
                  connection.upstream_token);
   }
 
-  void close_connection(std::uint64_t connection_id, ConnectionState final_state, std::string detail) {
+  void close_connection(std::uint64_t connection_id, ConnectionState final_state, std::string detail,
+                        TimePoint now) {
     const auto iterator = connections_.find(connection_id);
     if (iterator == connections_.end()) {
       return;
@@ -375,19 +528,22 @@ class ProxyRuntime {
     static_cast<void>(::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_DEL, connection.upstream_fd.get(), nullptr));
     bindings_.erase(connection.client_token);
     bindings_.erase(connection.upstream_token);
-    detail += connection.relay.close_detail();
+    detail += connection.relay.close_detail(now);
     logger_.event("connection_closed", connection.id, state_name(final_state), detail);
     connections_.erase(iterator);
   }
 
   ProxyConfig config_;
+  FaultPlan disabled_faults_{};
   Logger logger_;
   SystemSocketIo socket_io_;
   UniqueFd listener_;
   UniqueFd signal_fd_;
+  UniqueFd timer_fd_;
   UniqueFd epoll_fd_;
+  TimerQueue timer_queue_;
   std::uint64_t next_connection_id_{1};
-  std::uint64_t next_token_{3};
+  std::uint64_t next_token_{4};
   std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> connections_;
   std::unordered_map<std::uint64_t, SocketBinding> bindings_;
 };
@@ -409,6 +565,12 @@ Proxy::Proxy(ProxyConfig config) : config_(std::move(config)) {
       (config_.socket_buffer_bytes < 1'024 || config_.socket_buffer_bytes > 1'024U * 1'024U)) {
     throw std::invalid_argument("socket_buffer_bytes must be 0 (kernel default) or between 1024 and 1048576");
   }
+  if (config_.connect_timeout < std::chrono::milliseconds::zero() ||
+      config_.idle_timeout < std::chrono::milliseconds::zero() ||
+      config_.connect_timeout > std::chrono::minutes{10} || config_.idle_timeout > std::chrono::minutes{10}) {
+    throw std::invalid_argument("timeouts must be between 0 (disabled) and 600000 ms");
+  }
+  config_.faults.validate();
   if (!config_.listen.is_loopback() && !config_.allow_non_loopback_listen) {
     throw std::invalid_argument("non-loopback listen requires --unsafe-allow-non-loopback-listen");
   }
