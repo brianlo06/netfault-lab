@@ -57,8 +57,12 @@ if(BUILD_TESTING)
     tests/unit/backpressure_test.cpp
     tests/unit/byte_queue_test.cpp
     tests/unit/connection_state_test.cpp
+    tests/unit/delay_line_test.cpp
     tests/unit/endpoint_test.cpp
+    tests/unit/fault_rng_test.cpp
     tests/unit/relay_test.cpp
+    tests/unit/timer_queue_test.cpp
+    tests/unit/token_bucket_test.cpp
   )
   target_link_libraries(netfault-unit-tests PRIVATE netfault_core Catch2::Catch2WithMain netfault_warnings)
 
