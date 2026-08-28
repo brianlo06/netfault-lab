@@ -2,7 +2,9 @@
 
 NetFault Lab is a Linux/C++20 workbench for reproducing and explaining TCP failure behavior in isolated, authorized test environments.
 
-> **Milestone 4 status:** the repository implements loopback-safe, nonblocking, bidirectional TCP forwarding with Linux `epoll`, fixed-capacity per-direction buffers with configurable watermarks, orderly half-close propagation, deterministic seeded fault injection (latency/jitter, token-bucket rate limits, reset and half-close injection), timerfd-driven connect/idle timeouts, structured connection logs, an atomically written JSON metrics export, a request-response benchmark client with reproducible pooled latency percentiles, a controlled multi-mode server, fake-clock unit tests, fault-scenario integration tests, a Linux container test, and GitHub Actions CI under ASan/UBSan and TSan. YAML configuration, absolute performance claims, and the dashboard are not implemented yet.
+> **Milestone 5 status:** the core workbench is complete — loopback-safe, nonblocking, bidirectional TCP forwarding with Linux `epoll`, bounded buffers with configurable watermarks, orderly half-close propagation, deterministic seeded fault injection (latency/jitter, token-bucket rate limits, reset and half-close injection), timerfd-driven connect/idle timeouts, structured connection logs, an atomically written JSON metrics export, a request-response benchmark client with reproducible pooled latency percentiles, boundary payload sweeps, an aborting soak with FD/RSS plateau evidence, a packet-capture comparison reconciling the wire against the event log, and GitHub Actions CI under Release, ASan/UBSan, and TSan. YAML configuration, absolute performance claims, and the optional dashboard are not implemented.
+
+**See it work in five minutes: [docs/demo.md](docs/demo.md)** — the benchmark client measures the proxy's own fault injection, and the logged delay budget reconciles against the measured distribution.
 
 ## Safety first
 
@@ -29,7 +31,7 @@ Each connection pairs its two sockets with a `Relay`: the forwarding engine that
 
 Fault injection composes over this engine rather than branching inside socket code: each direction may carry a delay line (latency/jitter segments over the same bounded queue, so delay creates no hidden storage) and a token bucket, while lifecycle faults (reset, injected half-close) trigger on forwarded-byte budgets. A destination blocked purely on time suppresses `EPOLLOUT` and reports its earliest useful wake time; one `CLOCK_MONOTONIC` timerfd, armed from a min-heap of `(deadline, sequence)` entries, drives those wakes plus connect/idle timeouts. All fault randomness derives from one master seed through documented SplitMix64 mixing, so runs are reproducible.
 
-The full design, state model, assumptions, risk register, and milestone plan are in [docs/milestone-0-design.md](docs/milestone-0-design.md). Milestone execution evidence is recorded in [docs/milestone-1-report.md](docs/milestone-1-report.md), [docs/milestone-2-report.md](docs/milestone-2-report.md), [docs/milestone-3-report.md](docs/milestone-3-report.md), and [docs/milestone-4-report.md](docs/milestone-4-report.md).
+The full design, state model, assumptions, risk register, and milestone plan are in [docs/milestone-0-design.md](docs/milestone-0-design.md). Milestone execution evidence is recorded in [docs/milestone-1-report.md](docs/milestone-1-report.md), [docs/milestone-2-report.md](docs/milestone-2-report.md), [docs/milestone-3-report.md](docs/milestone-3-report.md), [docs/milestone-4-report.md](docs/milestone-4-report.md), and [docs/milestone-5-report.md](docs/milestone-5-report.md).
 
 ## Build and test
 
@@ -101,9 +103,10 @@ The summary reports pooled nearest-rank latency percentiles plus the full config
 
 ## Known limitations
 
-- No YAML parser, stall faults, metrics endpoint (the export is an on-demand file), or dashboard yet.
+- No YAML parser, stall faults, metrics endpoint (the export is an on-demand file), or dashboard.
 - Faults are proxy-global: every fault-applied connection receives the same plan.
 - The benchmark measures sequential request/response only; no pipelining or open-loop load, and no absolute performance numbers are published.
+- The soak's CI duration is 45 seconds; longer soaks are manual via `NETFAULT_SOAK_SECONDS`.
 - The proxy uses IPv4 and level-triggered `epoll` only.
 
 ## Roadmap
@@ -112,7 +115,7 @@ The summary reports pooled nearest-rank latency percentiles plus the full config
 2. Bounded-buffer/backpressure metrics and saturation tests — complete ([report](docs/milestone-2-report.md)).
 3. Nonblocking latency/jitter, token-bucket bandwidth, half-close/reset fault policies, timeouts, and deterministic seeding — complete ([report](docs/milestone-3-report.md)).
 4. Metrics export and reproducible benchmark harness — complete ([report](docs/milestone-4-report.md)).
-5. Sanitizer/stress CI, containers, packet-capture comparison, and professional documentation — next milestone (CI is already running).
-6. Optional dashboard and thread-per-connection comparison.
+5. Stress/soak evidence, payload sweeps, packet-capture comparison, Release CI lane, and demo documentation — complete ([report](docs/milestone-5-report.md)).
+6. Optional: dashboard and thread-per-connection comparison — not planned unless needed.
 
 No performance numbers will be published until the benchmark methodology is implemented and run.
