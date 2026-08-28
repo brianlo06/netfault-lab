@@ -44,9 +44,12 @@ Two subtleties surfaced while making the pcap comparison honest, both now encode
 
 ### Issues found and fixed during this milestone
 
+- **A real timer race, caught by CI.** The event loop re-armed the timerfd at the end of every epoll iteration, even when the earliest deadline was unchanged — and `timerfd_settime` clears any pending expiration by design. If the timer expired in the window between `epoll_wait` returning (woken by an unrelated socket event) and the end-of-iteration rearm, the pending readable state could be consumed and the expiration lost. On Azure's 6.17 kernel this reproducibly left connect-timeout connections hanging forever while the idle scenario (whose traffic kept generating events) worked. The fix skips `timerfd_settime` entirely when the armed deadline is unchanged, and the arm cache is invalidated when a firing is consumed. The proxy now also logs `timer_armed` (with delta) and `timer_fired` (entries processed) so any recurrence carries evidence. Two-of-three CI jobs failed before the fix; three consecutive fully-green three-lane runs followed it.
 - The ASan RSS climb described above — initially read as a failure, actually the quarantine working as designed; the fix was measuring what the allocator can promise rather than relaxing blindly.
 - The pcap byte-accounting subtleties above.
+- The controlled server held every finished connection thread joinable (stacks unreleased) until shutdown; the accept loop now reaps completed workers.
 - GCC 13 at `-O3` raises a false-positive `-Wstringop-overflow` inside libstdc++ heap code inlined from `priority_queue::pop`; suppressed with a narrowly scoped, documented pragma rather than weakening the global warning set.
+- One ASan soak round observed a single `payload_mismatch` on CI before the timer fix; it has not recurred across subsequent runs, and the soak now dumps the proxy's recent events in its failure message so any recurrence is diagnosable.
 
 ## Known limitations
 
