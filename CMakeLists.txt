@@ -117,4 +117,17 @@ if(BUILD_TESTING)
     )
     set_tests_properties(milestone4-${scenario} PROPERTIES TIMEOUT 180)
   endforeach()
+
+  foreach(scenario sweep soak pcap)
+    add_test(
+      NAME milestone5-${scenario}
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/milestone5_${scenario}.py
+        --proxy $<TARGET_FILE:netfault-proxy>
+        --server $<TARGET_FILE:netfault-server>
+        --client $<TARGET_FILE:netfault-client>
+    )
+  endforeach()
+  set_tests_properties(milestone5-sweep PROPERTIES TIMEOUT 240)
+  set_tests_properties(milestone5-soak PROPERTIES TIMEOUT 300)
+  set_tests_properties(milestone5-pcap PROPERTIES TIMEOUT 120)
 endif()

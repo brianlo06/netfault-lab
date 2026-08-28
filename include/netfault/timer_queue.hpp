@@ -29,6 +29,11 @@ class TimerQueue {
     heap_.push(TimerEvent{deadline, next_sequence_++, connection_id, kind});
   }
 
+  // GCC 13 at -O3 raises a false-positive -Wstringop-overflow inside the
+  // libstdc++ heap routines inlined from priority_queue::pop (the analyzer
+  // loses track of the vector's real size); suppressed narrowly here.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
   [[nodiscard]] std::optional<TimerEvent> pop_due(std::chrono::steady_clock::time_point now) {
     if (heap_.empty() || heap_.top().deadline > now) {
       return std::nullopt;
@@ -37,6 +42,7 @@ class TimerQueue {
     heap_.pop();
     return event;
   }
+#pragma GCC diagnostic pop
 
   [[nodiscard]] std::optional<std::chrono::steady_clock::time_point> next_deadline() const {
     if (heap_.empty()) {

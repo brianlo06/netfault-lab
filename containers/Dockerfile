@@ -8,6 +8,7 @@ RUN apt-get update \
         cmake \
         ninja-build \
         python3 \
+        tcpdump \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
