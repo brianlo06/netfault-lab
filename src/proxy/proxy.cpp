@@ -184,7 +184,11 @@ class ProxyRuntime {
           }
         } else if (token == kTimerToken) {
           drain_timer_fd();
-          process_due_timers(std::chrono::steady_clock::now());
+          const auto now = std::chrono::steady_clock::now();
+          const auto processed = process_due_timers(now);
+          logger_.event("timer_fired", 0, "listening",
+                        "processed=" + std::to_string(processed) +
+                            ",pending=" + std::to_string(timer_queue_.size()));
         } else {
           socket_ready(token, event_mask);
         }
@@ -244,6 +248,9 @@ class ProxyRuntime {
 
   void arm_timer_fd() {
     const auto deadline = timer_queue_.next_deadline();
+    if (deadline == last_armed_deadline_) {
+      return;  // avoid rearm churn; an unchanged armed deadline stays valid
+    }
     itimerspec spec{};
     if (deadline) {
       auto since_epoch = deadline->time_since_epoch();
@@ -260,11 +267,26 @@ class ProxyRuntime {
     }
     if (::timerfd_settime(timer_fd_.get(), TFD_TIMER_ABSTIME, &spec, nullptr) < 0) {
       logger_.event("timer_arm_failed", 0, "failed", std::strerror(errno));
+      return;
+    }
+    last_armed_deadline_ = deadline;
+    if (deadline) {
+      const auto delta_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                *deadline - std::chrono::steady_clock::now())
+                                .count();
+      logger_.event("timer_armed", 0, "listening",
+                    "delta_ms=" + std::to_string(delta_ms) +
+                        ",pending=" + std::to_string(timer_queue_.size()));
     }
   }
 
-  void process_due_timers(TimePoint now) {
+  std::size_t process_due_timers(TimePoint now) {
+    // The armed deadline is consumed by this firing (or superseded below), so
+    // the next arm call must not be suppressed by the change-detection cache.
+    last_armed_deadline_.reset();
+    std::size_t processed = 0;
     while (auto event = timer_queue_.pop_due(now)) {
+      ++processed;
       const auto iterator = connections_.find(event->connection_id);
       if (iterator == connections_.end()) {
         continue;  // stale entry for a removed connection; discarded lazily
@@ -293,6 +315,7 @@ class ProxyRuntime {
         }
       }
     }
+    return processed;
   }
 
   // Builds the exported JSON document from event-loop-owned values. All
@@ -627,6 +650,7 @@ class ProxyRuntime {
   UniqueFd timer_fd_;
   UniqueFd epoll_fd_;
   TimerQueue timer_queue_;
+  std::optional<TimePoint> last_armed_deadline_;
   std::uint64_t next_connection_id_{1};
   std::uint64_t next_token_{4};
   std::uint64_t closes_fully_closed_{0};

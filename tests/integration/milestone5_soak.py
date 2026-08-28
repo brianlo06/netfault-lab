@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from harness import (  # noqa: E402
     default_environment,
     free_port,
+    read_events,
     rss_kib,
     stop_process,
     wait_for_fd_count_at_most,
@@ -128,9 +129,11 @@ def main() -> int:
                 )
                 summary = json.loads(client.stdout) if client.returncode == 0 else None
                 if summary is None or summary["successful"] != connections:
+                    recent_events = json.dumps(read_events(proxy_log)[-12:])
                     raise AssertionError(
                         f"soak round failed: soak_seed={seed} round={rounds} connections={connections} "
-                        f"payload_bytes={payload_bytes} stdout={client.stdout!r} stderr={client.stderr!r}"
+                        f"payload_bytes={payload_bytes} stdout={client.stdout!r} stderr={client.stderr!r} "
+                        f"recent_proxy_events={recent_events}"
                     )
                 connections_total += connections
 

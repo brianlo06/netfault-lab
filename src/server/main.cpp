@@ -8,8 +8,10 @@
 #include <sys/socket.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <charconv>
+#include <memory>
 #include <span>
 #include <cstdlib>
 #include <cstring>
@@ -100,7 +102,19 @@ void send_then_half_close(std::stop_token stop_token, int fd, std::span<std::byt
   drain_until_eof(stop_token, fd, buffer);
 }
 
-void serve_client(std::stop_token stop_token, netfault::UniqueFd client, ServerConfig config) {
+// Set by each worker when its connection completes, so the accept loop can
+// reap finished threads: joinable thread stacks are not released until join.
+struct WorkerSlot {
+  std::jthread thread;
+  std::shared_ptr<std::atomic<bool>> done;
+};
+
+void serve_client(std::stop_token stop_token, netfault::UniqueFd client, ServerConfig config,
+                  std::shared_ptr<std::atomic<bool>> done) {
+  const struct DoneGuard {
+    std::shared_ptr<std::atomic<bool>>& flag;
+    ~DoneGuard() { flag->store(true); }
+  } guard{done};
   timeval timeout{1, 0};
   static_cast<void>(::setsockopt(client.get(), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)));
   static_cast<void>(::setsockopt(client.get(), SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)));
@@ -262,21 +276,27 @@ int main(int argc, char** argv) {
     std::cout << "{\"event\":\"server_started\",\"listen\":\"" << listen_endpoint.to_string()
               << "\",\"mode\":\"" << mode_name(config.mode) << "\",\"delay_ms\":"
               << config.delay.count() << ",\"chunk_bytes\":" << config.chunk_bytes << "}\n" << std::flush;
-    std::vector<std::jthread> workers;
+    std::vector<WorkerSlot> workers;
+    const auto reap_finished = [&workers] {
+      std::erase_if(workers, [](const WorkerSlot& slot) { return slot.done->load(); });
+    };
     while (stop_requested == 0) {
       netfault::UniqueFd client{::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC)};
       if (client) {
-        workers.emplace_back(serve_client, std::move(client), config);
+        reap_finished();
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        workers.push_back({std::jthread{serve_client, std::move(client), config, done}, done});
         continue;
       }
       if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+        reap_finished();
         std::this_thread::sleep_for(std::chrono::milliseconds{10});
         continue;
       }
       throw std::runtime_error("accept: " + std::string{std::strerror(errno)});
     }
     for (auto& worker : workers) {
-      worker.request_stop();
+      worker.thread.request_stop();
     }
     workers.clear();
     std::cout << "{\"event\":\"server_stopped\"}\n" << std::flush;
