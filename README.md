@@ -4,6 +4,11 @@ NetFault Lab is a Linux/C++20 workbench for reproducing and explaining TCP failu
 
 > **Milestone 5 status:** the core workbench is complete — loopback-safe, nonblocking, bidirectional TCP forwarding with Linux `epoll`, bounded buffers with configurable watermarks, orderly half-close propagation, deterministic seeded fault injection (latency/jitter, token-bucket rate limits, reset and half-close injection), timerfd-driven connect/idle timeouts, structured connection logs, an atomically written JSON metrics export, a request-response benchmark client with reproducible pooled latency percentiles, boundary payload sweeps, an aborting soak with FD/RSS plateau evidence, a packet-capture comparison reconciling the wire against the event log, and GitHub Actions CI under Release, ASan/UBSan, and TSan. YAML configuration, absolute performance claims, and the optional dashboard are not implemented.
 
+**Project site: [netfault.jarvisworlds.com](https://netfault.jarvisworlds.com)** — replay real captured runs in the
+browser: watch the queue fill against its watermarks, reads pause and resume, and faults fire, with the
+proxy's own event log streaming alongside. The captures are produced by
+[`tools/capture_site_data.py`](tools/capture_site_data.py); no proxy runs on that page.
+
 **See it work in five minutes: [docs/demo.md](docs/demo.md)** — the benchmark client measures the proxy's own fault injection, and the logged delay budget reconciles against the measured distribution.
 
 ## Safety first
@@ -108,6 +113,13 @@ The summary reports pooled nearest-rank latency percentiles plus the full config
 - The benchmark measures sequential request/response only; no pipelining or open-loop load, and no absolute performance numbers are published.
 - The soak's CI duration is 45 seconds; longer soaks are manual via `NETFAULT_SOAK_SECONDS`.
 - The proxy uses IPv4 and level-triggered `epoll` only.
+- **Write-side busy loop against a slow upstream.** Level-triggered `epoll` re-reports the upstream socket
+  writable while its send buffer accounts for per-packet overhead rather than payload, so `send()` can
+  return `EAGAIN` immediately afterwards and the loop spins without progress. Measured over one 1 MiB
+  transfer through a slow reader: 131 `EAGAIN` results with an unconstrained upstream buffer versus 721,806
+  with `--socket-buffer-bytes 4096`. Correctness is unaffected — bytes are exact and the suite passes — but
+  CPU is wasted. The fix is edge-triggered write interest, deferred as future work because it changes the
+  event loop's notification contract and deserves its own testing pass.
 
 ## Roadmap
 

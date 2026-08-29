@@ -4,3 +4,8 @@
 *.pcapng
 *.log
 .DS_Store
+
+# Local tool caches — the wrangler cache records account identity
+.wrangler/
+__pycache__/
+*.pyc

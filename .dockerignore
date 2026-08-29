@@ -2,3 +2,5 @@
 build
 benchmarks/raw
 dashboard/node_modules
+site/
+tools/

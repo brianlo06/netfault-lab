@@ -1,0 +1,29 @@
+{
+  "scenarios": [
+    {
+      "key": "backpressure",
+      "title": "Backpressure under a slow reader",
+      "summary": "The upstream reads deliberately slowly and its socket buffer is capped, so the kernel cannot absorb the backlog. The proxy's fixed-capacity queue fills to its high-water mark, reads pause, the queue drains to the low-water mark, and reads resume \u2014 for the whole transfer, with no unbounded buffering and no dropped bytes."
+    },
+    {
+      "key": "latency",
+      "title": "Deterministic latency and jitter injection",
+      "summary": "Every forwarded chunk is held 40 ms \u00b1 10 ms of seeded jitter in each direction. Bytes stay in the same bounded queue with an eligibility time, so delay never creates hidden storage, and the event loop never sleeps \u2014 a timerfd wakes it when bytes come due."
+    },
+    {
+      "key": "rate-limit",
+      "title": "Token-bucket rate limiting",
+      "summary": "A 100 KB/s token bucket with a 10 KB burst paces the client-to-upstream direction. Refill uses integer arithmetic that carries sub-byte remainders, so long-run throughput equals the configured rate exactly."
+    },
+    {
+      "key": "reset",
+      "title": "Injected connection reset",
+      "summary": "The proxy is configured to reset the connection once it has forwarded 50,000 bytes. The fault fires at the byte budget and the connection closes in a distinct reset state \u2014 the packet-capture test in the repository confirms a real RST reaches the wire."
+    },
+    {
+      "key": "idle-timeout",
+      "title": "Idle timeout via timerfd",
+      "summary": "After one exchange the client goes quiet. A deadline held in a min-heap and armed on a single timerfd expires, and the proxy closes the connection in a distinct timed-out state without ever blocking the event loop."
+    }
+  ]
+}

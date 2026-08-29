@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetFault Lab — reproducing TCP failure behaviour</title>
+<meta name="description" content="A Linux/C++20 workbench that reproduces TCP failure behaviour on purpose: an epoll proxy with bounded buffers, deterministic seeded fault injection, and evidence for every claim.">
+<meta property="og:title" content="NetFault Lab">
+<meta property="og:description" content="A Linux/C++20 workbench that reproduces TCP failure behaviour on purpose — with evidence for every claim.">
+<meta property="og:type" content="website">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230b0f14'/><path d='M7 20h4l3-9 4 13 3-8h4' stroke='%234dd4c4' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="eyebrow">Linux · C++20 · systems networking</p>
+    <h1>NetFault&nbsp;Lab</h1>
+    <p class="tagline">A workbench that reproduces TCP failure behaviour <em>on purpose</em> — and proves what it did.</p>
+    <p class="lede">
+      An <code>epoll</code> proxy with fixed-capacity queues, deterministic seeded fault injection,
+      timer-driven timeouts, and a machine-readable account of every byte it moved. Everything below is
+      replayed from real recorded runs of the actual binaries.
+    </p>
+    <div class="cta">
+      <a class="button primary" href="https://github.com/brianlo06/netfault-lab">View source on GitHub</a>
+      <a class="button" href="#replay">Watch a run</a>
+    </div>
+    <ul class="badges">
+      <li><span>13</span> automated tests</li>
+      <li><span>3</span> CI lanes: Release · ASan/UBSan · TSan</li>
+      <li><span>11,925</span> connections in the soak, 128&nbsp;KiB RSS drift</li>
+      <li><span>0</span> runtime dependencies</li>
+    </ul>
+  </div>
+</header>
+
+<main>
+
+<section id="replay" class="section">
+  <div class="wrap">
+    <h2>Replay a real run</h2>
+    <p class="section-lede">
+      Each scenario below is a genuine capture: the proxy's own JSON&nbsp;Lines event log, plus a time series
+      of its metrics documents sampled while the workload ran. Nothing here is simulated or hand-authored —
+      <a href="https://github.com/brianlo06/netfault-lab/blob/main/tools/capture_site_data.py">the capture tool is in the repository</a>.
+      No proxy is running on this page; a TCP relay reachable from the internet would be an open relay, and
+      the project is loopback-only by design.
+    </p>
+
+    <div class="player" id="player" aria-live="polite">
+      <div class="scenario-tabs" role="tablist" aria-label="Captured scenarios" id="scenarioTabs"></div>
+
+      <p class="scenario-summary" id="scenarioSummary">Loading captured runs…</p>
+
+      <div class="commands" id="commands"></div>
+
+      <div class="stage">
+        <div class="node client">
+          <span class="node-name">client</span>
+          <span class="node-sub">deterministic workload</span>
+        </div>
+
+        <div class="pipes">
+          <div class="pipe" data-dir="c2u">
+            <div class="pipe-head">
+              <span class="pipe-label">client&nbsp;→&nbsp;upstream</span>
+              <span class="pause-badge" id="c2uPause" hidden>reads paused</span>
+            </div>
+            <div class="queue" id="c2uQueue">
+              <div class="queue-fill" id="c2uFill"></div>
+              <div class="watermark low" id="c2uLow"><span>low</span></div>
+              <div class="watermark high" id="c2uHigh"><span>high</span></div>
+            </div>
+            <div class="pipe-foot"><span id="c2uBytes">0 B</span> queued</div>
+          </div>
+
+          <div class="pipe reverse" data-dir="u2c">
+            <div class="pipe-head">
+              <span class="pipe-label">upstream&nbsp;→&nbsp;client</span>
+              <span class="pause-badge" id="u2cPause" hidden>reads paused</span>
+            </div>
+            <div class="queue" id="u2cQueue">
+              <div class="queue-fill" id="u2cFill"></div>
+              <div class="watermark low" id="u2cLow"><span>low</span></div>
+              <div class="watermark high" id="u2cHigh"><span>high</span></div>
+            </div>
+            <div class="pipe-foot"><span id="u2cBytes">0 B</span> queued</div>
+          </div>
+        </div>
+
+        <div class="node upstream">
+          <span class="node-name">upstream</span>
+          <span class="node-sub">controlled server</span>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button id="playBtn" class="play" aria-label="Play">
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>
+        </button>
+        <input id="scrub" class="scrub" type="range" min="0" max="1000" value="0" step="1" aria-label="Timeline position">
+        <span class="clock"><span id="clockNow">0.000</span> / <span id="clockEnd">0.000</span> s</span>
+        <label class="speed">
+          speed
+          <select id="speed">
+            <option value="0.25">0.25×</option>
+            <option value="0.5">0.5×</option>
+            <option value="1" selected>1×</option>
+            <option value="2">2×</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="readouts" id="readouts"></div>
+
+      <div class="log-head">
+        <h3>Proxy event log</h3>
+        <label class="toggle">
+          <input type="checkbox" id="showArtifacts">
+          show capture-sampling events
+        </label>
+      </div>
+      <div class="log" id="log" role="log"></div>
+      <p class="log-note">
+        Log lines are verbatim from the proxy. The optional entries are the ones the capture tool itself
+        provoked by signalling the proxy for a metrics snapshot — kept in the data for fidelity, hidden by
+        default because the measurement is not part of the story.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>How it works</h2>
+    <p class="section-lede">
+      One thread, one event loop, and no hidden buffers. Every connection owns two fixed-capacity queues;
+      faults compose over them instead of branching through the socket code.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 900 330" role="img" aria-labelledby="archTitle archDesc">
+        <title id="archTitle">NetFault Lab architecture</title>
+        <desc id="archDesc">A client connects to the proxy, which forwards to an upstream server. The proxy's event loop watches sockets, a signal descriptor, and a timer descriptor. Each connection holds two bounded byte queues with backpressure watermarks, plus optional fault channels for delay and rate limiting.</desc>
+
+        <rect x="20" y="130" width="120" height="66" rx="8" class="d-box"/>
+        <text x="80" y="158" class="d-title">client</text>
+        <text x="80" y="178" class="d-sub">workload</text>
+
+        <rect x="760" y="130" width="120" height="66" rx="8" class="d-box"/>
+        <text x="820" y="158" class="d-title">upstream</text>
+        <text x="820" y="178" class="d-sub">server</text>
+
+        <rect x="200" y="40" width="500" height="250" rx="12" class="d-panel"/>
+        <text x="450" y="66" class="d-panel-title">netfault-proxy</text>
+
+        <rect x="228" y="84" width="444" height="42" rx="7" class="d-inner"/>
+        <text x="450" y="105" class="d-label">level-triggered epoll event loop</text>
+        <text x="450" y="119" class="d-sub">sockets · signalfd · timerfd — never sleeps</text>
+
+        <rect x="228" y="140" width="212" height="60" rx="7" class="d-inner accent"/>
+        <text x="334" y="161" class="d-label">Relay</text>
+        <text x="334" y="177" class="d-sub">two bounded queues</text>
+        <text x="334" y="191" class="d-sub">watermarks · half-close</text>
+
+        <rect x="460" y="140" width="212" height="60" rx="7" class="d-inner warn"/>
+        <text x="566" y="161" class="d-label">fault channels</text>
+        <text x="566" y="177" class="d-sub">delay line · token bucket</text>
+        <text x="566" y="191" class="d-sub">seeded, per direction</text>
+
+        <rect x="228" y="214" width="212" height="54" rx="7" class="d-inner"/>
+        <text x="334" y="235" class="d-label">TimerQueue</text>
+        <text x="334" y="252" class="d-sub">min-heap → one timerfd</text>
+
+        <rect x="460" y="214" width="212" height="54" rx="7" class="d-inner"/>
+        <text x="566" y="235" class="d-label">metrics + JSON Lines log</text>
+        <text x="566" y="252" class="d-sub">atomic export on demand</text>
+
+        <path d="M140 163 L 200 163" class="d-arrow"/>
+        <path d="M700 163 L 760 163" class="d-arrow"/>
+        <path d="M760 182 L 700 182" class="d-arrow rev"/>
+        <path d="M200 182 L 140 182" class="d-arrow rev"/>
+      </svg>
+    </figure>
+
+    <div class="cards">
+      <article class="card">
+        <h3>Bytes are bounded, always</h3>
+        <p>
+          Each direction gets one fixed-capacity circular queue allocated at accept. When it reaches the
+          high-water mark the proxy stops reading that socket; when it drains to the low-water mark reading
+          resumes. Nothing is dropped and nothing grows without limit — including delayed bytes, which stay
+          in the same queue with an eligibility time rather than moving to a side buffer.
+        </p>
+      </article>
+      <article class="card">
+        <h3>Faults are deterministic</h3>
+        <p>
+          All fault randomness derives from one master seed through a documented SplitMix64 mixing chain:
+          seed → connection → direction. Whether a connection receives faults is decided once at accept and
+          logged. The same seed and configuration reproduce the same decisions across process restarts,
+          which a test asserts over sixteen sequential connections.
+        </p>
+      </article>
+      <article class="card">
+        <h3>The loop never sleeps</h3>
+        <p>
+          Latency injection, rate limiting, and timeouts all resolve to deadlines in a min-heap keyed by
+          <code>(deadline, sequence)</code>, armed on a single <code>CLOCK_MONOTONIC</code> timerfd. A
+          destination blocked purely on time suppresses its write interest rather than spinning on a
+          writable socket.
+        </p>
+      </article>
+      <article class="card">
+        <h3>No clocks below the event loop</h3>
+        <p>
+          The forwarding engine never reads a clock: every method takes the current time as a parameter.
+          That single constraint makes latency, jitter and token-bucket behaviour testable at fabricated
+          timestamps — the full fault suite runs without a single real sleep.
+        </p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="wrap">
+    <h2>Four problems worth the write-up</h2>
+    <p class="section-lede">
+      The tests earned their keep. These are real defects, each with a root cause that only shows up once
+      you look at what the kernel actually promises — including one that this very page uncovered.
+    </p>
+
+    <ol class="findings">
+      <li>
+        <h3>A lost timer expiration</h3>
+        <p class="finding-where">Found by CI on an Azure 6.17 kernel · <a href="https://github.com/brianlo06/netfault-lab/blob/main/docs/milestone-5-report.md">Milestone 5</a></p>
+        <p>
+          The event loop re-armed its timerfd at the end of every iteration, even when the earliest deadline
+          had not changed. But <code>timerfd_settime</code> <em>clears a pending expiration</em> as part of
+          arming. If the timer fired in the window between an unrelated socket wakeup and that rearm, the
+          expiration was silently swallowed and the deadline never fired — connections waiting on a connect
+          timeout hung forever. The fix is to skip arming entirely when the earliest deadline is unchanged.
+          It reproduced on CI and never locally, because it needs a wakeup to land in a window a few
+          microseconds wide.
+        </p>
+      </li>
+      <li>
+        <h3>Partial writes that would not happen</h3>
+        <p class="finding-where">Found while proving a code path · <a href="https://github.com/brianlo06/netfault-lab/blob/main/docs/milestone-2-report.md">Milestone 2</a></p>
+        <p>
+          The proxy retries short <code>send()</code> results, but no test could force one. Loopback TCP
+          copies up to its ~64&nbsp;KiB size goal before it consults send-buffer memory, so any smaller write
+          either completes fully or returns <code>EAGAIN</code> — a positive short write simply never occurs.
+          Provoking one needs a queue larger than that goal <em>and</em> a constrained upstream socket buffer.
+          Until then the retry loop was correct by inspection and unproven by test; now it is covered both by
+          a scripted fake at the socket boundary and against the real kernel.
+        </p>
+      </li>
+      <li>
+        <h3>A test harness corrupting its own evidence</h3>
+        <p class="finding-where">Found chasing a 1-in-10 flake · <a href="https://github.com/brianlo06/netfault-lab/blob/main/docs/milestone-3-report.md">Milestone 3</a></p>
+        <p>
+          Integration tests polled the proxy's log through the same Python file object whose descriptor the
+          proxy had inherited as stdout. Both handles shared one open file description — and therefore one
+          offset — so the harness's <code>seek(0)</code> rewound the <em>writer</em>, and the proxy's next
+          line overwrote the beginning of its own log. The symptom was events appearing out of order. The
+          fix reads through an independent file description instead.
+        </p>
+      </li>
+      <li>
+        <h3>A busy loop the tests could not see</h3>
+        <p class="finding-where">Found by building this page · open, documented as future work</p>
+        <p>
+          Capturing the backpressure run above surfaced something no test asserts on: while the upstream is
+          slow, the proxy can log over half a million <code>EAGAIN</code> results for a single one-mebibyte
+          transfer. The cause is level-triggered <code>epoll</code> on the write side. The kernel reports the
+          upstream socket writable — its send-buffer accounting counts per-packet overhead rather than
+          payload — the proxy attempts a write, gets <code>EAGAIN</code>, and the loop immediately goes round
+          again with nothing having moved. A controlled comparison isolates it: the same transfer with an
+          unconstrained upstream buffer produces 131 <code>EAGAIN</code> results, and with a constrained one,
+          721,806.
+        </p>
+        <p>
+          It is a performance defect, not a correctness one — every byte still arrives, in order, and the
+          whole suite passes. The real fix is edge-triggered write interest, which only re-notifies on a
+          transition to writable; the original design chose level-triggered deliberately, for auditability,
+          and flagged the switch as later work. It is recorded as a known limitation rather than quietly
+          patched, and the capture that exposed it is the one playing above.
+        </p>
+      </li>
+    </ol>
+  </div>
+</section>
+
+<section class="section alt">
+  <div class="wrap">
+    <h2>Evidence</h2>
+    <p class="section-lede">
+      Claims in this project are expected to come with a way to check them. No absolute throughput or
+      latency numbers are published, because the benchmark methodology that would justify them measures an
+      end-to-end loopback path, not the proxy in isolation.
+    </p>
+
+    <div class="evidence-grid">
+      <div class="ev">
+        <h3>Correctness</h3>
+        <dl>
+          <div><dt>Automated tests</dt><dd>13 targets, unit + integration</dd></div>
+          <div><dt>Sanitizers</dt><dd>ASan, UBSan, TSan — clean</dd></div>
+          <div><dt>Warnings</dt><dd><code>-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror</code></dd></div>
+          <div><dt>Payload sweep</dt><dd>17 boundary sizes + 12 seeded random, byte-exact</dd></div>
+        </dl>
+      </div>
+      <div class="ev">
+        <h3>Resource discipline</h3>
+        <dl>
+          <div><dt>Soak</dt><dd>1,672 rounds · 11,925 connections · 2,502 abrupt aborts</dd></div>
+          <div><dt>Memory</dt><dd>128 KiB RSS drift across the soak</dd></div>
+          <div><dt>Descriptors</dt><dd>back to baseline after every round</dd></div>
+          <div><dt>Buffers</dt><dd>fixed capacity per direction, allocated once</dd></div>
+        </dl>
+      </div>
+      <div class="ev">
+        <h3>Honesty checks</h3>
+        <dl>
+          <div><dt>Wire vs. log</dt><dd>packet capture reconciles handshakes, bytes and the injected RST</dd></div>
+          <div><dt>Reproducibility</dt><dd>every run records its seed; failing seeds are printed</dd></div>
+          <div><dt>Determinism</dt><dd>identical fault decisions across process restarts</dd></div>
+          <div><dt>Scope</dt><dd>loopback by default; non-loopback needs explicit unsafe flags</dd></div>
+        </dl>
+      </div>
+    </div>
+
+    <p class="reports">
+      Full milestone reports — including what each one failed to prove —
+      <a href="https://github.com/brianlo06/netfault-lab/tree/main/docs">are in the repository</a>.
+    </p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <strong>NetFault Lab</strong> · built by Brian Lo ·
+      <a href="https://github.com/brianlo06/netfault-lab">github.com/brianlo06/netfault-lab</a>
+    </p>
+    <p class="fine">
+      Use only systems you own or are explicitly authorised to test. This page runs no proxy and accepts no
+      connections; it replays runs recorded on a loopback interface.
+    </p>
+  </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
