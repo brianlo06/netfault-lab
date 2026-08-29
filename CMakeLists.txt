@@ -118,7 +118,7 @@ if(BUILD_TESTING)
     set_tests_properties(milestone4-${scenario} PROPERTIES TIMEOUT 180)
   endforeach()
 
-  foreach(scenario sweep soak pcap)
+  foreach(scenario sweep soak pcap spin)
     add_test(
       NAME milestone5-${scenario}
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/milestone5_${scenario}.py
@@ -130,4 +130,5 @@ if(BUILD_TESTING)
   set_tests_properties(milestone5-sweep PROPERTIES TIMEOUT 240)
   set_tests_properties(milestone5-soak PROPERTIES TIMEOUT 300)
   set_tests_properties(milestone5-pcap PROPERTIES TIMEOUT 120)
+  set_tests_properties(milestone5-spin PROPERTIES TIMEOUT 180)
 endif()

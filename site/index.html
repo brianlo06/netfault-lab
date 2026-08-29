@@ -28,7 +28,7 @@
       <a class="button" href="#replay">Watch a run</a>
     </div>
     <ul class="badges">
-      <li><span>13</span> automated tests</li>
+      <li><span>14</span> automated tests</li>
       <li><span>3</span> CI lanes: Release · ASan/UBSan · TSan</li>
       <li><span>11,925</span> connections in the soak, 128&nbsp;KiB RSS drift</li>
       <li><span>0</span> runtime dependencies</li>
@@ -227,10 +227,10 @@
 
 <section class="section">
   <div class="wrap">
-    <h2>Four problems worth the write-up</h2>
+    <h2>Five problems worth the write-up</h2>
     <p class="section-lede">
       The tests earned their keep. These are real defects, each with a root cause that only shows up once
-      you look at what the kernel actually promises — including one that this very page uncovered.
+      you look at what the kernel actually promises — including two that this very page uncovered.
     </p>
 
     <ol class="findings">
@@ -272,23 +272,45 @@
       </li>
       <li>
         <h3>A busy loop the tests could not see</h3>
-        <p class="finding-where">Found by building this page · open, documented as future work</p>
+        <p class="finding-where">Found by building this page · fixed, with a regression guard</p>
         <p>
-          Capturing the backpressure run above surfaced something no test asserts on: while the upstream is
-          slow, the proxy can log over half a million <code>EAGAIN</code> results for a single one-mebibyte
-          transfer. The cause is level-triggered <code>epoll</code> on the write side. The kernel reports the
-          upstream socket writable — its send-buffer accounting counts per-packet overhead rather than
-          payload — the proxy attempts a write, gets <code>EAGAIN</code>, and the loop immediately goes round
-          again with nothing having moved. A controlled comparison isolates it: the same transfer with an
-          unconstrained upstream buffer produces 131 <code>EAGAIN</code> results, and with a constrained one,
-          721,806.
+          Capturing the backpressure run above surfaced something no test asserted on: a single one-mebibyte
+          transfer through a slow upstream logged <strong>721,806</strong> <code>EAGAIN</code> results, and
+          the proxy burned most of a CPU core waiting on a peer that was, by construction, slow.
         </p>
         <p>
-          It is a performance defect, not a correctness one — every byte still arrives, in order, and the
-          whole suite passes. The real fix is edge-triggered write interest, which only re-notifies on a
-          transition to writable; the original design chose level-triggered deliberately, for auditability,
-          and flagged the switch as later work. It is recorded as a known limitation rather than quietly
-          patched, and the capture that exposed it is the one playing above.
+          The cause was <code>EPOLLRDHUP</code>, requested unconditionally. It is level-triggered and stays
+          asserted from the moment a peer half-closes — and the client half-closes as soon as it has sent its
+          payload. With backpressure holding reads paused, the loop woke on that flag, correctly declined to
+          read, performed a futile flush, and woke again immediately: a hot loop on a condition it had
+          deliberately decided not to act on yet. The fix is to request <code>EPOLLRDHUP</code> only
+          alongside read interest, which costs nothing, because level-triggered delivery re-reports the
+          half-close the moment reads resume.
+        </p>
+        <p>
+          My first reading of the evidence was wrong. I blamed spurious writability — the kernel calling a
+          socket writable while <code>send()</code> still refuses — which fitted the <code>EAGAIN</code>
+          counter but could not explain why an <em>unconstrained</em> upstream, producing just 131
+          <code>EAGAIN</code> results, still burned 196 CPU ticks. A spin with empty queues never reaches a
+          <code>send()</code>, so it never moves that counter at all. The regression guard now asserts both
+          signals, and was checked against the pre-fix build to confirm it actually fails there.
+        </p>
+      </li>
+      <li>
+        <h3>A rate limiter that dribbled</h3>
+        <p class="finding-where">Found re-measuring after the previous fix · fixed</p>
+        <p>
+          Moving 200&nbsp;kB through a 100&nbsp;kB/s token bucket took <strong>144,936</strong> read and
+          write operations — about 1.4 bytes per system call. Nothing was incorrect: the rate was enforced
+          exactly and every byte arrived in order. It was simply the least efficient possible way to honour
+          the limit, because the bucket released the instant a single byte's worth of tokens had accrued.
+        </p>
+        <p>
+          A direction now waits until it can release a worthwhile quantum, bounded by the bytes actually
+          queued and by the configured burst so a small tail still drains rather than stalling. The same
+          200&nbsp;kB now takes 149 operations at about 1,342 bytes each, with CPU falling from 39% of wall
+          time to 0.5% — and the wall time itself unchanged at 1.92&nbsp;s, which is the point. The limit is
+          enforced to the same accuracy using three orders of magnitude fewer syscalls.
         </p>
       </li>
     </ol>
@@ -308,7 +330,7 @@
       <div class="ev">
         <h3>Correctness</h3>
         <dl>
-          <div><dt>Automated tests</dt><dd>13 targets, unit + integration</dd></div>
+          <div><dt>Automated tests</dt><dd>14 targets, unit + integration</dd></div>
           <div><dt>Sanitizers</dt><dd>ASan, UBSan, TSan — clean</dd></div>
           <div><dt>Warnings</dt><dd><code>-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror</code></dd></div>
           <div><dt>Payload sweep</dt><dd>17 boundary sizes + 12 seeded random, byte-exact</dd></div>

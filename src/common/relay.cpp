@@ -19,6 +19,19 @@ std::optional<Relay::TimePoint> earlier(std::optional<Relay::TimePoint> left,
   return std::min(*left, *right);
 }
 
+// A rate-limited direction waits until it can release a worthwhile chunk
+// rather than forwarding the moment a single byte's worth of tokens exists.
+// Without this the loop wakes continuously to write a byte or two: moving
+// 200 kB at 100 kB/s cost 144,936 read and write operations, about 1.4 bytes
+// each. The quantum is bounded by the bytes actually available to send and by
+// the configured burst, so a small tail, or a bucket whose burst is smaller
+// than the quantum, still drains instead of stalling.
+constexpr std::size_t kPreferredReleaseBytes = 4'096;
+
+[[nodiscard]] std::size_t release_quantum(std::size_t eligible_bytes, std::size_t burst_bytes) {
+  return std::min({eligible_bytes, burst_bytes, kPreferredReleaseBytes});
+}
+
 }  // namespace
 
 Relay::Relay(const RelayConfig& config, const FaultPlan& faults, std::uint64_t connection_id,
@@ -125,7 +138,11 @@ std::size_t Relay::fault_sendable(Direction& direction, std::size_t limit, TimeP
     limit = std::min(limit, channel.delay->releasable(now));
   }
   if (channel.bucket) {
-    limit = std::min(limit, channel.bucket->available(now));
+    const auto available = channel.bucket->available(now);
+    if (available < release_quantum(limit, channel.bucket->burst_bytes())) {
+      return 0;  // wait for a worthwhile chunk instead of dribbling
+    }
+    limit = std::min(limit, available);
   }
   return limit;
 }
@@ -283,7 +300,9 @@ std::optional<Relay::TimePoint> Relay::next_wake(Side destination, TimePoint now
     }
   }
   if (channel.bucket && releasable > 0) {
-    wake = earlier(wake, channel.bucket->eligible_at(releasable, now));
+    // Sleep until the release quantum is affordable, not merely one byte.
+    wake = earlier(wake, channel.bucket->eligible_at(
+                             release_quantum(releasable, channel.bucket->burst_bytes()), now));
   }
   return wake;
 }

@@ -59,6 +59,74 @@ Two subtleties surfaced while making the pcap comparison honest, both now encode
 - Demo media is a captured terminal walkthrough; a screen recording for LinkedIn Featured remains to be produced by hand.
 - Still numeric IPv4 only, level-triggered epoll only.
 
+## Addendum — a busy loop found after the milestone closed
+
+Building the [project site](https://netfault.jarvisworlds.com), which replays captured runs, surfaced a
+defect none of the tests could see: a single 1 MiB transfer through a slow upstream logged **721,806
+`EAGAIN` results**, and the proxy burned most of a CPU while waiting on a peer that was, by construction,
+slow.
+
+**Root cause.** `EPOLLRDHUP` was requested unconditionally. It is level-triggered and stays asserted from
+the moment a peer half-closes. The deterministic client sends its payload and then half-closes, so from
+that point the flag was permanently ready. When backpressure had paused reads on that socket, the loop woke
+on `EPOLLRDHUP`, correctly declined to read (the queue was above the low-water mark), performed a futile
+flush, and immediately woke again — a hot loop on a condition the proxy had deliberately decided not to act
+on yet.
+
+An earlier reading of the evidence blamed spurious writability — the kernel reporting a socket writable
+while `send()` still returns `EAGAIN`. That theory fitted the `EAGAIN` counter but not the measurements: it
+failed to explain why an *unconstrained* upstream, which produced only 131 `EAGAIN` results, still burned
+196 CPU ticks. The `EPOLLRDHUP` explanation covers both, because a spin with empty queues never reaches a
+`send()` at all and so never moves the `EAGAIN` counter.
+
+**Fix.** Request `EPOLLRDHUP` only alongside read interest. This costs nothing: level-triggered delivery
+re-reports the half-close the moment reads resume, and a resumed read observes the EOF directly. Redundant
+`EPOLL_CTL_MOD` calls were removed at the same time — the loop had been rewriting both registrations every
+iteration, about two `epoll_ctl` calls per wakeup.
+
+| Workload (1 MiB through a slow reader) | Before | After |
+|---|---|---|
+| `EAGAIN`, constrained upstream buffer | 721,806 | 485 |
+| CPU ticks, constrained upstream buffer | 90 | 3 |
+| `EAGAIN`, default upstream buffer | 131 | 107 |
+| CPU ticks, default upstream buffer | 196 | 10 |
+
+## Addendum — a rate limiter that dribbled
+
+Re-measuring the captured scenarios after that fix exposed a second, unrelated inefficiency in the same
+family. Moving 200 kB through a 100 kB/s token bucket took **144,936 read and write operations** — about
+1.4 bytes per syscall.
+
+**Root cause.** The bucket released as soon as a single byte's worth of tokens had accrued, so the loop woke
+constantly to forward a byte or two. Nothing was incorrect: the rate was enforced exactly and every byte
+arrived in order. It was simply the least efficient possible way to honour the limit.
+
+**Fix.** A direction now waits until it can release a worthwhile quantum — 4 KiB, bounded by the bytes
+actually queued and by the configured burst, so a small tail or a burst smaller than the quantum still
+drains rather than stalling. The wake-up calculation targets that same quantum, so the timer sleeps until a
+useful chunk is affordable instead of until the next single byte.
+
+| Workload (200 kB through a 100 kB/s bucket) | Before | After |
+|---|---|---|
+| Read + write operations | 144,936 | 149 |
+| Bytes per operation | 1.4 | 1,342 |
+| `EAGAIN` | 48,302 | 47 |
+| Proxy CPU as a fraction of wall time | 39% | 0.5% |
+| Wall time | 1,929 ms | 1,922 ms |
+
+Wall time is unchanged, which is the point: the rate limit is still enforced to the same accuracy, using
+three orders of magnitude fewer syscalls.
+
+**Regression guard.** `milestone5-spin` asserts three independent signals across three workloads, because
+these defects have three distinct shapes: a queue-backed spin burns one `EAGAIN` per futile iteration; an
+empty-queue spin burns CPU without moving the `EAGAIN` counter at all, since a flush with nothing queued
+never reaches a `send()`; and a dribbling rate limiter moves bytes efficiently by neither measure while
+issuing a syscall per byte. The guard runs in plain builds only — sanitizers slow each iteration enough
+that a spinning build reaches just 1.3 `EAGAIN` per operation while the honest build's own CPU fraction
+rises to 0.31, leaving the two barely distinguishable. A performance guard belongs in the build that
+represents performance. It was verified against the pre-fix build, where it fails at 919 `EAGAIN` per I/O
+operation against a limit of 60.
+
 ## Remaining roadmap
 
 Milestone 6 is optional per the design document: a dashboard/API consuming the metrics DTO, a thread-per-connection comparison, or flamegraph work. The core workbench — forwarding, backpressure, deterministic faults, timeouts, metrics, benchmark, stress evidence, CI — is complete.

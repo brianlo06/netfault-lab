@@ -113,13 +113,6 @@ The summary reports pooled nearest-rank latency percentiles plus the full config
 - The benchmark measures sequential request/response only; no pipelining or open-loop load, and no absolute performance numbers are published.
 - The soak's CI duration is 45 seconds; longer soaks are manual via `NETFAULT_SOAK_SECONDS`.
 - The proxy uses IPv4 and level-triggered `epoll` only.
-- **Write-side busy loop against a slow upstream.** Level-triggered `epoll` re-reports the upstream socket
-  writable while its send buffer accounts for per-packet overhead rather than payload, so `send()` can
-  return `EAGAIN` immediately afterwards and the loop spins without progress. Measured over one 1 MiB
-  transfer through a slow reader: 131 `EAGAIN` results with an unconstrained upstream buffer versus 721,806
-  with `--socket-buffer-bytes 4096`. Correctness is unaffected — bytes are exact and the suite passes — but
-  CPU is wasted. The fix is edge-triggered write interest, deferred as future work because it changes the
-  event loop's notification contract and deserves its own testing pass.
 
 ## Roadmap
 

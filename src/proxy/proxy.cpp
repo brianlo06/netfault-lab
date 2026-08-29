@@ -72,6 +72,8 @@ struct Connection {
   UniqueFd upstream_fd;
   std::uint64_t client_token{0};
   std::uint64_t upstream_token{0};
+  std::uint32_t client_mask{0};    // last mask applied via epoll_ctl
+  std::uint32_t upstream_mask{0};
   std::optional<TimePoint> scheduled_wake;
   ConnectionLogObserver observer;
   Relay relay;
@@ -226,10 +228,20 @@ class ProxyRuntime {
     }
   }
 
+  // EPOLLERR and EPOLLHUP are delivered whether or not they are requested, so
+  // they need not be named here beyond documenting the intent.
+  //
+  // EPOLLRDHUP is requested only alongside read interest. It is level-
+  // triggered and stays asserted from the moment a peer half-closes, so
+  // holding it while reads are paused for backpressure wakes the event loop
+  // continuously for a condition we have deliberately chosen not to act on
+  // yet — a busy loop that makes no progress. Dropping it with read interest
+  // costs nothing: level-triggered delivery re-reports the half-close as soon
+  // as reads resume, and a resumed read observes the EOF directly anyway.
   [[nodiscard]] static std::uint32_t to_epoll_mask(InterestSet interest) {
-    std::uint32_t events = EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+    std::uint32_t events = EPOLLERR | EPOLLHUP;
     if (interest.read) {
-      events |= EPOLLIN;
+      events |= EPOLLIN | EPOLLRDHUP;
     }
     if (interest.write) {
       events |= EPOLLOUT;
@@ -480,10 +492,10 @@ class ProxyRuntime {
       bindings_.emplace(connection->client_token, SocketBinding{connection_id, Side::Client});
       bindings_.emplace(connection->upstream_token, SocketBinding{connection_id, Side::Upstream});
       auto& inserted = *connections_.emplace(connection_id, std::move(connection)).first->second;
-      add_epoll(client_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Client, now)),
-                inserted.client_token);
-      add_epoll(upstream_fd, to_epoll_mask(inserted.relay.desired_interest(Side::Upstream, now)),
-                inserted.upstream_token);
+      inserted.client_mask = to_epoll_mask(inserted.relay.desired_interest(Side::Client, now));
+      inserted.upstream_mask = to_epoll_mask(inserted.relay.desired_interest(Side::Upstream, now));
+      add_epoll(client_fd, inserted.client_mask, inserted.client_token);
+      add_epoll(upstream_fd, inserted.upstream_mask, inserted.upstream_token);
       logger_.event("connection_accepted", connection_id, state_name(inserted.relay.state()));
       if (config_.faults.any_enabled()) {
         logger_.event("fault_config", connection_id, state_name(inserted.relay.state()),
@@ -604,11 +616,22 @@ class ProxyRuntime {
       close_connection(connection_id, ConnectionState::FullyClosed, "orderly_shutdown", now);
       return;
     }
-    modify_epoll(connection.client_fd.get(),
-                 to_epoll_mask(connection.relay.desired_interest(Side::Client, now)), connection.client_token);
-    modify_epoll(connection.upstream_fd.get(),
-                 to_epoll_mask(connection.relay.desired_interest(Side::Upstream, now)),
-                 connection.upstream_token);
+    apply_interest(connection, Side::Client, now);
+    apply_interest(connection, Side::Upstream, now);
+  }
+
+  // Re-registers a socket's epoll interest only when the mask actually
+  // changes; the loop otherwise spends two epoll_ctl calls per iteration
+  // rewriting registrations that are already correct.
+  void apply_interest(Connection& connection, Side side, TimePoint now) {
+    const auto mask = to_epoll_mask(connection.relay.desired_interest(side, now));
+    auto& cached = side == Side::Client ? connection.client_mask : connection.upstream_mask;
+    if (mask == cached) {
+      return;
+    }
+    cached = mask;
+    modify_epoll(side == Side::Client ? connection.client_fd.get() : connection.upstream_fd.get(), mask,
+                 side == Side::Client ? connection.client_token : connection.upstream_token);
   }
 
   void close_connection(std::uint64_t connection_id, ConnectionState final_state, std::string detail,
