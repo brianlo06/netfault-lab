@@ -12,11 +12,14 @@
 
 namespace {
 
+// Zero is accepted: several options (timeouts, fault parameters, seed) use 0
+// to mean "disabled" or "default"; range validation happens in the Proxy
+// constructor and FaultPlan::validate.
 std::size_t parse_size(std::string_view text, std::string_view name) {
   std::size_t value = 0;
   const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
   if (error != std::errc{} || end != text.data() + text.size()) {
-    throw std::invalid_argument(std::string{name} + " must be a positive integer");
+    throw std::invalid_argument(std::string{name} + " must be a non-negative integer");
   }
   return value;
 }
