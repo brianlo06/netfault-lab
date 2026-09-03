@@ -48,7 +48,6 @@ class TokenBucket {
     return now + std::chrono::nanoseconds{wait_ns};
   }
 
-  [[nodiscard]] std::size_t rate_bytes_per_second() const noexcept { return rate_; }
   [[nodiscard]] std::size_t burst_bytes() const noexcept { return burst_; }
 
  private:

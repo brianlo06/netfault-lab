@@ -20,10 +20,6 @@ namespace netfault {
 
 enum class Side { Client, Upstream };
 
-[[nodiscard]] constexpr std::string_view side_name(Side side) noexcept {
-  return side == Side::Client ? "client" : "upstream";
-}
-
 struct RelayConfig {
   std::size_t buffer_bytes_per_direction{65'536};
   std::size_t low_water_bytes{32'768};
