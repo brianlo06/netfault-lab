@@ -9,8 +9,10 @@ namespace netfault {
 // (Steele/Lea/Flood): every per-connection/per-direction stream is derived from
 // the master seed by pure arithmetic, so results never depend on container
 // iteration order or wall-clock time.
+inline constexpr std::uint64_t kSplitMix64Gamma = 0x9E3779B97F4A7C15ULL;
+
 [[nodiscard]] constexpr std::uint64_t splitmix64_mix(std::uint64_t value) noexcept {
-  value += 0x9E3779B97F4A7C15ULL;
+  value += kSplitMix64Gamma;
   value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
   value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
   return value ^ (value >> 31U);
@@ -20,12 +22,12 @@ class SplitMix64 {
  public:
   explicit constexpr SplitMix64(std::uint64_t seed) noexcept : state_(seed) {}
 
+  // Equivalent to advancing the state by one gamma and mixing it; written in
+  // terms of splitmix64_mix so the mixing constants live in exactly one place.
   constexpr std::uint64_t next() noexcept {
-    state_ += 0x9E3779B97F4A7C15ULL;
-    std::uint64_t value = state_;
-    value = (value ^ (value >> 30U)) * 0xBF58476D1CE4E5B9ULL;
-    value = (value ^ (value >> 27U)) * 0x94D049BB133111EBULL;
-    return value ^ (value >> 31U);
+    const auto value = splitmix64_mix(state_);
+    state_ += kSplitMix64Gamma;
+    return value;
   }
 
  private:
